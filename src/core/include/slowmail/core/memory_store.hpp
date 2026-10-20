@@ -1,5 +1,6 @@
 #pragma once
 #include <map>
+#include <memory>
 #include <mutex>
 
 #include "slowmail/core/store.hpp"
@@ -72,6 +73,8 @@ private:
     std::vector<SessionEvent> events_;
     std::optional<std::string> token_blob_;
     std::optional<ErrorKind> fail_next_;
+    struct Snapshot;                       // state captured by begin(), restored by rollback()
+    std::shared_ptr<Snapshot> snapshot_;
     std::recursive_mutex mu_;
     Status maybe_fail();
 };

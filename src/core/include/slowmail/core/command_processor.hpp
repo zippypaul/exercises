@@ -15,6 +15,7 @@ struct ProcessReport {
     std::size_t deferred_retry = 0;    // still pending (retryable error / throttled)
     std::optional<int> retry_after_seconds;  // largest Retry-After seen
     bool went_offline = false;         // a Network error stopped processing
+    bool auth_required = false;        // an Auth error stopped processing; caller moves session to AuthRequired
 };
 
 struct RetryPolicy {

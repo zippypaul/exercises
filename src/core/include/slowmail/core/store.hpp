@@ -85,7 +85,8 @@ public:
     Transaction& operator=(const Transaction&) = delete;
 private:
     Store& store_;
-    bool done_ = false;
+    bool done_ = false;       // true once committed, or when begin() failed (nothing to roll back)
+    Status begin_status_;     // result of begin(); returned by commit() if begin() failed
 };
 
 } // namespace slowmail::core
