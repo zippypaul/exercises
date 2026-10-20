@@ -146,9 +146,9 @@ def parse_prefer(headers: Any) -> Dict[str, str]:
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str, headers: Optional[List[Tuple[str, str]]] = None):
-        super().__init__(message)
-        self.status, self.code, self.message, self.headers = status, code, message, headers or []
+    def __init__(self, status: int, code: str, message: str = "", headers: Optional[List[Tuple[str, str]]] = None):
+        super().__init__(message or code)
+        self.status, self.code, self.message, self.headers = status, code, message or code, headers or []
 
 
 class Resp:

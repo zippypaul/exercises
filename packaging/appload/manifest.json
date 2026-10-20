@@ -1,0 +1,10 @@
+{
+  "id": "slowmail",
+  "name": "Slow Mail",
+  "loadsBackend": true,
+  "entry": "backend/entry",
+  "canHaveMultipleFrontends": false,
+  "supportsScaling": false,
+  "aspectRatio": "auto",
+  "disablesWindowedMode": true
+}

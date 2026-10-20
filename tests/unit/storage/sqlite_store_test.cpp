@@ -782,7 +782,10 @@ TEST_P(SqliteStoreTest, ThousandMessagesInOneTransactionFastAndOrdered) {
     ASSERT_TRUE(store_->commit().ok());
     auto q = store_->list_queue();
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    EXPECT_LT(elapsed, 2.0);
+    // SLOWMAIL_TEST_TIME_SCALE loosens wall-clock bounds under emulation (QEMU) or slow CI.
+    const char* scale_env = std::getenv("SLOWMAIL_TEST_TIME_SCALE");
+    const double scale = scale_env ? std::atof(scale_env) : 1.0;
+    EXPECT_LT(elapsed, 2.0 * (scale > 0 ? scale : 1.0));
     ASSERT_EQ(q.size(), 1000u);
     EXPECT_EQ(store_->count_messages(), 1000u);
     for (std::size_t i = 1; i < q.size(); ++i) {

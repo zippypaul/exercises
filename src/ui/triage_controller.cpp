@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QLocale>
 #include <QMetaObject>
+#include <QSet>
 
 #include <algorithm>
 
@@ -105,7 +106,7 @@ struct JobGuard {
 // ---------------------------------------------------------------------------------------------------------------
 RowModel::RowModel(const QList<QByteArray>& roles, QObject* parent) : QAbstractListModel(parent), roles_(roles) {}
 
-int RowModel::rowCount(const QModelIndex& parent) const { return parent.isValid() ? 0 : rows_.size(); }
+int RowModel::rowCount(const QModelIndex& parent) const { return parent.isValid() ? 0 : static_cast<int>(rows_.size()); }
 
 QVariant RowModel::data(const QModelIndex& index, int role) const {
     if (!index.isValid() || index.row() < 0 || index.row() >= rows_.size()) return {};
@@ -126,14 +127,14 @@ QVariantMap RowModel::get(int row) const {
 }
 
 void RowModel::setRows(const QVector<QVariantMap>& rows) {
-    const int before = rows_.size();
+    const int before = static_cast<int>(rows_.size());
     const QString key = QStringLiteral("id");
 
     QSet<QString> newIds;
     for (const auto& r : rows) newIds.insert(r.value(key).toString());
 
     // 1. rows that vanished
-    for (int i = rows_.size() - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(rows_.size()) - 1; i >= 0; --i) {
         if (!newIds.contains(rows_.at(i).value(key).toString())) {
             beginRemoveRows(QModelIndex(), i, i);
             rows_.remove(i);
@@ -295,7 +296,11 @@ void TriageWorker::flush() {
     JobGuard g(this);
     const core::ProcessReport r = ctx_->session().flush();
     if (r.auth_required) emit errorOccurred(QStringLiteral("Sign-in required."));
-    else if (r.went_offline) emit errorOccurred(describeError(core::Error{core::ErrorKind::Network, {}, 0, {}, {}}));
+    else if (r.went_offline) {
+        core::Error e;
+        e.kind = core::ErrorKind::Network;
+        emit errorOccurred(describeError(e));
+    }
     else if (r.failed > 0) emit errorOccurred(QStringLiteral("%1 action(s) failed. See Activity.").arg(r.failed));
     else emit errorOccurred(QString());
     emitSnapshot();
@@ -606,6 +611,8 @@ void TriageController::cancelSignIn() {
     post("cancelSignIn", false);
 }
 
+void TriageController::checkSignIn() { post("pollSignIn", false); }
+
 void TriageController::endSession() { post("endSession"); }
 void TriageController::signOut(bool wipe) { postWithBool("signOut", wipe); }
 
@@ -662,6 +669,13 @@ void TriageController::onSnapshot(const slowmail::ui::Snapshot& snap) {
     emit statusChanged();
 }
 
+void TriageController::showConfigError(const QString& message) {
+    localError_ = message;
+    ready_ = true;
+    recomputeError();
+    emit statusChanged();
+}
+
 void TriageController::loadDemoData() {
     demo_ = true;
     auto row = [](const char* id, const char* subj, const char* name, const char* addr, const char* when,
@@ -685,6 +699,9 @@ void TriageController::loadDemoData() {
     snap_.pendingCount = 1;
     snap_.deferredCount = 2;
     snap_.signedIn = true;
+    userCode_ = QStringLiteral("B7QX-4MZ9");
+    uri_ = QStringLiteral("https://microsoft.com/devicelogin");
+    signInMessage_ = QStringLiteral("Waiting for you to finish signing in on another device...");
     snap_.queue = {
         row("d1", "Q4 planning review: revised schedule and a deliberately long subject line that must wrap onto a second line and then be elided", "Alex Morgan", "alex@example.com", "00:58", "Please find the revised schedule attached. The budget session moves to Thursday.", true, false),
         row("d2", "Invoice 2026-1043 overdue", "Accounts Payable", "ap@example.com", "Mon 23:10", "This is a reminder that invoice 2026-1043 is now 14 days overdue.", true, true),

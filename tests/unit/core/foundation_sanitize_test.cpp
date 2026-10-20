@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <string>
 
 #include "slowmail/core/sanitize.hpp"
@@ -305,7 +306,10 @@ TEST(HtmlToText, PathologicalInputsAreLinearAndSafe) {
     EXPECT_TRUE(valid_utf8(out));
     EXPECT_FALSE(has_control(out));
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    EXPECT_LT(ms, 3000);
+    // SLOWMAIL_TEST_TIME_SCALE loosens wall-clock bounds under emulation (QEMU) or slow CI.
+    const char* scale_env = std::getenv("SLOWMAIL_TEST_TIME_SCALE");
+    const double scale = scale_env ? std::atof(scale_env) : 1.0;
+    EXPECT_LT(static_cast<double>(ms), 3000.0 * (scale > 0 ? scale : 1.0));
 }
 
 TEST(HtmlToText, EveryPrefixOfADocumentIsSafe) {

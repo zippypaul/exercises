@@ -1,0 +1,15 @@
+{
+  "name": "Slow Mail",
+  "id": "slowmail",
+  "version": "0.1.0",
+  "description": "DRAFT, UNTESTED. Inbox triage (Do / Delete / Defer). Launches the takeover wrapper.",
+  "application": "/home/root/.local/share/slowmail-app/run-slowmail.sh",
+  "workingDirectory": "/home/root/.local/share/slowmail-app",
+  "environment": {
+    "SLOWMAIL_APP_DIR": "/home/root/.local/share/slowmail-app"
+  },
+  "args": [],
+  "qtfb": false,
+  "disablesWindowedMode": true,
+  "aspectRatio": "auto"
+}

@@ -48,7 +48,7 @@ public:
     QVariant data(const QModelIndex& index, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
 
-    int count() const { return rows_.size(); }
+    int count() const { return static_cast<int>(rows_.size()); }
     void setRows(const QVector<QVariantMap>& rows);
     void removeById(const QString& id);
     Q_INVOKABLE QVariantMap get(int row) const;
@@ -163,6 +163,7 @@ public:
     Q_INVOKABLE void undo(const QString& commandId);
     Q_INVOKABLE void beginSignIn();
     Q_INVOKABLE void cancelSignIn();
+    Q_INVOKABLE void checkSignIn();   // poll once now (the worker also polls on its own schedule)
     Q_INVOKABLE void endSession();
     Q_INVOKABLE void signOut(bool wipe);
     Q_INVOKABLE void clearError();
@@ -173,6 +174,9 @@ public:
     // Populate the models and a canned message body without a session. Used only by `--demo` for UI review
     // screenshots; nothing is written anywhere.
     void loadDemoData();
+
+    // No session could be built (bad configuration): show the problem in the error banner.
+    void showConfigError(const QString& message);
 
 signals:
     void statusChanged();

@@ -60,12 +60,12 @@ Goal: show that when the launcher or OS does not work, the user ends up in the s
 
 Host dry run (no device), do this first:
 1. Create a directory with a fake `systemctl` that appends its arguments to a log and exits 0, and a fake `slowmail` that exits 1. Put it first in `PATH`.
-2. Run `packaging/run-slowmail.sh` with `SLOWMAIL_BIN` pointing at the fake binary.
+2. Run `sh packaging/run-slowmail.sh` with `SLOWMAIL_BIN` pointing at the fake binary and `SLOWMAIL_ENV_FILE=/nonexistent`. (The documentation agent ran this dry run once on 2026-10-20 with a logging `systemctl` shim: exit status of the app was propagated and `mask`, `stop xochitl`, `unmask`, `start xochitl` were logged in that order, also after SIGTERM; a missing binary exited 127 without calling `systemctl`. Not recorded in TEST_LOG.md; re-run it there.)
 3. Expect: the log shows `stop xochitl` then `start xochitl`, and the script exits non-zero without hanging. Repeat with the fake binary killed by `kill -TERM` and with the script itself sent SIGINT and SIGTERM; `start xochitl` must appear each time.
 
 Device procedure (spare device, backup verified, OS and launcher versions recorded):
 1. Record `cat /etc/os-release`, the launcher versions (xovi, AppLoad) and the OS build in TEST_LOG.md.
-2. Take-over route: run the wrapper with a deliberately wrong binary path. Expect the stock UI to return within about a minute (passcode prompt expected, COMPAT 3 breakage 10) and `systemctl is-active xochitl` = `active`.
+2. Take-over route: (a) run the wrapper with a wrong `SLOWMAIL_BIN` path: it must refuse (exit 127) without stopping `xochitl`. (b) Point `SLOWMAIL_BIN` at a shell script that exits with status 1: the stock UI must return within about a minute (passcode prompt expected, COMPATIBILITY breakage 10) and `systemctl is-active xochitl` must print `active`.
 3. Run the wrapper and kill the app with `kill -9` from a second SSH session. Expect the stock UI back. Then `kill -9` the wrapper itself: expect `xochitl` to stay stopped (known limitation); recover with `systemctl start xochitl` over SSH or a reboot. Record this result honestly.
 4. Launcher route (only if route B is being tried): record whether AppLoad appears and whether `xochitl` has `NRestarts=0` after 10 minutes. If the device crash-loops, reboot to stock and note it as a known breakage (COMPAT 3).
 5. Pass if the stock UI was recoverable by documented steps in every case and no case needed more than a reboot.
