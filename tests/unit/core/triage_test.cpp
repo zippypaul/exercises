@@ -267,7 +267,8 @@ TEST(TriageSession, UnflaggedElsewhereRestoresDeferredAtNextRefreshWithEvent) {
     EXPECT_TRUE(undeferred);
 }
 
-// A08 through the facade
+// A08 through the facade. The pending archive is delivered first (refresh flushes before it syncs); a message that
+// another client already moved is simply archived, and is never resurrected into the queue.
 TEST(TriageSession, MessageMovedElsewhereIsNotResurrected) {
     Rig r;
     r.ready();
@@ -279,9 +280,27 @@ TEST(TriageSession, MessageMovedElsewhereIsNotResurrected) {
     r.clock->advance(4 * kHour);
     ASSERT_TRUE(r.session->refresh().ok());
     auto cmd = r.store->get_command(a.value().id);
+    EXPECT_EQ(cmd->state, CommandState::Confirmed);
+    EXPECT_EQ(r.queue_ids(), (std::vector<std::string>{"m2", "m3"}));
+    EXPECT_EQ(r.store->get_message_state("m1"), MessageState::Archived);
+    EXPECT_EQ(r.session->status().pending_commands, 0u);
+}
+
+TEST(TriageSession, MessageRemovedElsewhereIsAbandonedAndNotResurrected) {
+    Rig r;
+    r.ready();
+    r.session->set_online(false);
+    auto a = r.session->archive("m1");
+    ASSERT_TRUE(a.ok());
+    r.backend->other_client_purge("m1");
+    r.session->set_online(true);
+    r.clock->advance(4 * kHour);
+    ASSERT_TRUE(r.session->refresh().ok());
+    auto cmd = r.store->get_command(a.value().id);
     EXPECT_EQ(cmd->state, CommandState::Abandoned);
     EXPECT_EQ(r.queue_ids(), (std::vector<std::string>{"m2", "m3"}));
     EXPECT_EQ(r.session->status().pending_commands, 0u);
+    r.backend->clear_calls();
     r.session->flush();
     EXPECT_EQ(r.backend->count("move"), 0);
     for (const auto& row : r.session->activity()) {
@@ -340,9 +359,10 @@ TEST(TriageSession, AuthErrorDuringFlushKeepsCommandPendingAndRecoversAfterSignI
     EXPECT_EQ(a.value().state, CommandState::Pending);
     EXPECT_EQ(r.session->status().session_state, SessionState::AuthRequired);
     EXPECT_EQ(r.session->archive("m2").error().kind, ErrorKind::Invalid);
-    ASSERT_TRUE(r.session->start().ok());
+    ASSERT_TRUE(r.session->start().ok());  // start() sends the leftover command once
+    EXPECT_EQ(r.store->list_commands(CommandState::Pending).size(), 0u);
     ProcessReport pr = r.session->flush();
-    EXPECT_EQ(pr.confirmed, 1u);
+    EXPECT_EQ(pr.confirmed, 0u);
     EXPECT_TRUE(r.backend->in_archive("m1"));
 }
 

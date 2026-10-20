@@ -6,13 +6,16 @@
 namespace slowmail::core {
 
 // Two clocks are needed: wall (persisted across reboots, manipulable) and monotonic
-// (trustworthy within a boot, resets on reboot). boot_id lets us know if a stored
+// (trustworthy within a boot, resets on reboot; counts suspended time on SystemClock). boot_id lets us know if a stored
 // monotonic reading is comparable with the current one.
 class Clock {
 public:
     virtual ~Clock() = default;
     virtual std::int64_t now_wall() const = 0;      // unix seconds UTC
-    virtual double now_mono() const = 0;            // seconds since arbitrary origin, never decreasing
+    // Seconds since an arbitrary origin, never decreasing within a boot. On the real clock this INCLUDES time spent
+    // suspended (CLOCK_BOOTTIME, falling back to CLOCK_MONOTONIC where unavailable), so cooldowns keep running
+    // while the device sleeps.
+    virtual double now_mono() const = 0;
     virtual std::string boot_id() const = 0;        // stable for the lifetime of this boot
 };
 

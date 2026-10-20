@@ -41,7 +41,7 @@ void sort_newest_first(std::vector<MessageSummary>& v) {
 Status MemoryStore::maybe_fail() {
     if (fail_next_) {
         ErrorKind k = *fail_next_;
-        fail_next_.reset();
+        if (--fail_count_ <= 0) fail_next_.reset();
         return make_error(k, "injected storage failure");
     }
     return Status::success();

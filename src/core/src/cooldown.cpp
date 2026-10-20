@@ -23,10 +23,13 @@ CooldownDecision CooldownPolicy::evaluate(const InboxSyncState& state, const Clo
 
     const bool mono_usable = state.last_complete_mono.has_value() && state.last_complete_boot_id.has_value() &&
                              *state.last_complete_boot_id == clock.boot_id();
+    const std::int64_t wall_elapsed = clock.now_wall() - last_wall;
     if (mono_usable) {
         const double elapsed = clock.now_mono() - *state.last_complete_mono;
         if (elapsed >= 0.0) {
-            if (elapsed >= static_cast<double>(cooldown)) {
+            // Either clock reaching the cooldown unlocks (fail open): the wall clock covers a monotonic source
+            // that does not count suspended time, and accepts a forward wall change (D23).
+            if (elapsed >= static_cast<double>(cooldown) || wall_elapsed >= cooldown) {
                 d.eligible = true;
                 d.reason = "elapsed";
             } else {
@@ -39,7 +42,6 @@ CooldownDecision CooldownPolicy::evaluate(const InboxSyncState& state, const Clo
         // A monotonic clock that went backwards is not trustworthy; fall through to wall time.
     }
 
-    const std::int64_t wall_elapsed = clock.now_wall() - last_wall;
     if (wall_elapsed < 0) {
         d.eligible = true;
         d.reason = "clock_anomaly";

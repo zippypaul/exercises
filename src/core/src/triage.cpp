@@ -22,9 +22,11 @@ struct TriageSession::Impl {
     SessionRecord session;
     bool opened = false;     // store.open() succeeded
     bool started = false;    // a session is active
-    bool online = true;
+    bool online = true;            // belief shown as StatusSnapshot::offline; never gates delivery by itself
+    bool hint_offline = false;     // set ONLY by an explicit set_online(false): suppresses auto-flush in act()
     bool signed_in = false;
     std::string last_error;
+    bool last_error_is_network = false;  // last_error describes a transport failure: cleared when the net is back
 
     Impl(Store& s, MailBackend& b, std::shared_ptr<Clock> c, TriageConfig cfg)
         : store(s),
@@ -60,9 +62,36 @@ struct TriageSession::Impl {
         if (!apply(SessionEvent_::AuthNeeded)) force(SessionState::AuthRequired);
     }
 
+    // start(): commands left over from an earlier run are sent once. One bounded attempt, errors ignored (a
+    // Network error leaves them Pending and marks us offline; nothing else blocks on the network).
+    void flush_pending_once() {
+        if (!started || !signed_in || machine.state() == SessionState::AuthRequired) return;
+        if (store.list_commands(CommandState::Pending).empty()) return;
+        (void)flush();
+    }
+
     void note_error(const Error& e) {
         last_error = redact(e.message);
         if (e.kind == ErrorKind::Auth) to_auth_required();
+    }
+
+    // A network operation got a real answer from the server (sync page, confirmed command, ...): whatever we
+    // believed about being offline is stale. Offline -> Active; the explicit hint and the banner are cleared.
+    void network_ok() {
+        online = true;
+        hint_offline = false;
+        if (last_error_is_network || last_error.rfind("offline", 0) == 0) {
+            last_error.clear();
+            last_error_is_network = false;
+        }
+        if (machine.state() == SessionState::Offline) (void)apply(SessionEvent_::NetworkBack);
+    }
+
+    void network_lost(const std::string& message) {
+        online = false;
+        last_error = message;
+        last_error_is_network = true;
+        (void)apply(SessionEvent_::NetworkLost);  // no-op outside Active; the offline flag still shows
     }
 
     ProcessReport flush() {
@@ -70,9 +99,9 @@ struct TriageSession::Impl {
         if (!started) return rep;
         rep = commands.process();
         if (rep.went_offline) {
-            online = false;
-            last_error = "offline: actions are queued";
-            (void)apply(SessionEvent_::NetworkLost);
+            network_lost("offline: actions are queued");
+        } else if (rep.reached_server) {
+            network_ok();
         }
         if (rep.auth_required) {
             last_error = "sign-in required";
@@ -88,9 +117,14 @@ struct TriageSession::Impl {
                                                                         to_string(machine.state()))
                                         .error());
         }
-        Outcome<Command> c = commands.enqueue(session.id, message_id, type, payload);
+        return deliver(commands.enqueue(session.id, message_id, type, payload));
+    }
+
+    // After a successful enqueue: try to send right away (a Network error just leaves it Pending).
+    // Only an explicit set_online(false) hint skips the attempt.
+    Outcome<Command> deliver(Outcome<Command> c) {
         if (!c.ok()) return c;
-        if (online) (void)flush();
+        if (!hint_offline) (void)flush();
         if (auto latest = store.get_command(c.value().id)) return *latest;
         return c;
     }
@@ -113,6 +147,7 @@ Status TriageSession::start() {
             if (acc.ok() && acc.value().signed_in) {
                 i.signed_in = true;
                 (void)i.apply(SessionEvent_::AuthOk);
+                i.flush_pending_once();
             }
         }
         return Status::success();
@@ -159,7 +194,10 @@ Status TriageSession::start() {
     SLOWMAIL_TRY(i.persist());
     i.started = true;
     i.online = true;
+    i.hint_offline = false;
     i.last_error.clear();
+    i.last_error_is_network = false;
+    i.flush_pending_once();
     SLOWMAIL_LOG_INFO("session: started id=" + i.session.id + " recovered=" + std::to_string(recovered) +
                       " queue=" + std::to_string(i.store.list_queue().size()) + " deferred=" +
                       std::to_string(i.store.list_messages_in_state(MessageState::Deferred).size()));
@@ -175,6 +213,25 @@ Outcome<SyncReport> TriageSession::refresh(bool force) {
                                        .error());
     }
 
+    // 1. Outgoing work first. Independent of the inbound cooldown; it is also the cheapest way to find out
+    //    whether the network is back.
+    const ProcessReport sent = i.flush();
+    if (sent.auth_required) return Outcome<SyncReport>(make_status(ErrorKind::Auth, "sign-in required").error());
+    if (sent.went_offline) {
+        Error e;
+        e.kind = ErrorKind::Network;
+        e.message = "offline: could not reach the server";
+        return Outcome<SyncReport>(e);
+    }
+    if (sent.retry_after_seconds) {
+        Error e;
+        e.kind = ErrorKind::Throttled;
+        e.message = "server asked us to slow down";
+        e.retry_after_seconds = sent.retry_after_seconds;
+        return Outcome<SyncReport>(e);
+    }
+
+    // 2. Then the inbound sync, if the cooldown allows.
     const CooldownDecision decision = i.sync.cooldown_decision();
     if (!force && !decision.eligible) {
         (void)i.apply(SessionEvent_::CooldownActive);  // no-op where not applicable; cached queue stays readable
@@ -184,25 +241,38 @@ Outcome<SyncReport> TriageSession::refresh(bool force) {
         return Outcome<SyncReport>(e);
     }
 
-    if (i.machine.state() != SessionState::SyncEligible && i.machine.state() != SessionState::SyncPartial) {
-        (void)i.apply(SessionEvent_::CooldownElapsed);
-    }
-    if (!i.apply(SessionEvent_::SyncStarted)) {
-        return Outcome<SyncReport>(make_status(ErrorKind::Invalid, "cannot start sync from current state").error());
+    // From Offline the machine is left alone: success moves it to Active (NetworkBack), failure keeps it Offline.
+    const bool from_offline = i.machine.state() == SessionState::Offline;
+    if (!from_offline) {
+        if (i.machine.state() != SessionState::SyncEligible && i.machine.state() != SessionState::SyncPartial) {
+            (void)i.apply(SessionEvent_::CooldownElapsed);
+        }
+        if (!i.apply(SessionEvent_::SyncStarted)) {
+            return Outcome<SyncReport>(make_status(ErrorKind::Invalid, "cannot start sync from current state").error());
+        }
     }
 
     SyncReport rep = i.sync.run(force);
     if (rep.complete) {
-        (void)i.apply(SessionEvent_::SyncCompleted);
+        if (!from_offline) (void)i.apply(SessionEvent_::SyncCompleted);
+        i.network_ok();
         if (!i.session.initial_sync_at) {
             i.session.initial_sync_at = i.clock->now_wall();
             (void)i.persist();
         }
         i.last_error.clear();
+        i.last_error_is_network = false;
         return rep;
     }
-    (void)i.apply(SessionEvent_::SyncInterrupted);
-    i.note_error(rep.error);
+    if (!from_offline) (void)i.apply(SessionEvent_::SyncInterrupted);
+    if (rep.error.kind == ErrorKind::Network) {
+        i.note_error(rep.error);
+        i.online = false;
+        i.last_error_is_network = true;
+    } else {
+        if (rep.error.kind != ErrorKind::Policy && rep.error.kind != ErrorKind::Storage) i.network_ok();  // we did get an answer from the server
+        i.note_error(rep.error);
+    }
     return Outcome<SyncReport>(rep.error);
 }
 
@@ -272,6 +342,38 @@ Outcome<Command> TriageSession::undo(const std::string& command_id) {
     return i.act(undo_type, original->message_id, payload.dump());
 }
 
+std::vector<MessageSummary> TriageSession::failed() const {
+    Impl& i = *impl_;
+    if (!i.opened) return {};
+    return i.store.list_messages_in_state(MessageState::Failed);
+}
+
+std::optional<Command> TriageSession::failed_command(const std::string& message_id) const {
+    Impl& i = *impl_;
+    if (!i.opened) return std::nullopt;
+    const std::vector<Command> history = i.store.list_commands_for_message(message_id);
+    for (auto it = history.rbegin(); it != history.rend(); ++it) {
+        if (it->state == CommandState::Failed) return *it;
+    }
+    return std::nullopt;
+}
+
+std::string TriageSession::failure_reason(const std::string& message_id) const {
+    if (const auto c = failed_command(message_id)) return c->last_error;
+    return {};
+}
+
+Outcome<Command> TriageSession::retry(const std::string& message_id) {
+    Impl& i = *impl_;
+    if (!i.started) return Outcome<Command>(make_status(ErrorKind::Invalid, "session not started").error());
+    if (!SessionStateMachine::can_process_mail(i.machine.state())) {
+        return Outcome<Command>(make_status(ErrorKind::Invalid, std::string("actions not allowed in state ") +
+                                                                    to_string(i.machine.state()))
+                                    .error());
+    }
+    return i.deliver(i.commands.retry(i.session.id, message_id));
+}
+
 std::vector<ActivityRow> TriageSession::activity() const {
     Impl& i = *impl_;
     std::vector<ActivityRow> rows;
@@ -305,7 +407,7 @@ Status TriageSession::end() {
     Impl& i = *impl_;
     if (!i.started) return make_status(ErrorKind::Invalid, "session not started");
     if (!i.apply(SessionEvent_::End)) i.force(SessionState::Ending);
-    if (i.online) (void)i.flush();  // pending commands survive for the next session if this fails
+    if (!i.hint_offline) (void)i.flush();  // pending commands survive for the next session if this fails
     if (!i.machine.apply(SessionEvent_::Ended)) i.machine = SessionStateMachine(SessionState::Ended);
     i.session.ended_at = i.clock->now_wall();
     i.session.state = SessionState::Ended;
@@ -356,16 +458,21 @@ StatusSnapshot TriageSession::status() const {
     s.pending_commands = i.store.list_commands(CommandState::Pending).size() +
                          i.store.list_commands(CommandState::InFlight).size();
     s.deferred_count = i.store.list_messages_in_state(MessageState::Deferred).size();
+    s.failed_count = i.store.list_messages_in_state(MessageState::Failed).size();
     return s;
 }
 
 void TriageSession::set_online(bool online) {
     Impl& i = *impl_;
     i.online = online;
+    i.hint_offline = !online;
     if (!i.started) return;
     if (online) {
         if (i.machine.state() == SessionState::Offline) (void)i.apply(SessionEvent_::NetworkBack);
-        if (i.last_error.rfind("offline", 0) == 0) i.last_error.clear();
+        if (i.last_error_is_network || i.last_error.rfind("offline", 0) == 0) {
+            i.last_error.clear();
+            i.last_error_is_network = false;
+        }
     } else {
         (void)i.apply(SessionEvent_::NetworkLost);
     }

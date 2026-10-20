@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -42,6 +43,10 @@ public:
     bool signed_in = true;
     bool immutable_ids = true;     // false: move() assigns a new id
     std::size_t page_size = 50;
+    // Test hook: runs right after a move()/set_flag() succeeded on the "server", before the caller sees the result.
+    std::function<void()> after_success;
+    // Test hook: runs when a scripted failure (fail_next) is delivered, before the caller sees the error.
+    std::function<void()> on_injected_failure;
 
     // ---- fixtures -----------------------------------------------------------------------------
     static MessageSummary make_message(const std::string& id, const std::string& subject = "",
@@ -212,6 +217,7 @@ public:
         if (!find(message_id)) return fail_<MoveResult>("move", message_id, dest, make_error(ErrorKind::NotFound, std::nullopt, "ErrorItemNotFound"));
         MoveResult r = relocate(message_id, destination);
         calls.push_back({"move", message_id, dest, true});
+        if (after_success) after_success();
         return r;
     }
 
@@ -222,6 +228,7 @@ public:
         if (!find(message_id)) { Error e = make_error(ErrorKind::NotFound, std::nullopt, "ErrorItemNotFound"); calls.push_back({"flag", message_id, val, false}); return Status(e); }
         apply_flag(message_id, status);
         calls.push_back({"flag", message_id, val, true});
+        if (after_success) after_success();
         return Status::success();
     }
 
@@ -284,6 +291,7 @@ private:
             Error e = make_error(it->kind, it->retry_after, it->code);
             if (--it->times <= 0) failures_.erase(it);
             calls.push_back({op, arg, extra, false});
+            if (on_injected_failure) on_injected_failure();
             return InjectedError{e};
         }
         return std::nullopt;

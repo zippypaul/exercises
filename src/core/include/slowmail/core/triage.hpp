@@ -24,6 +24,7 @@ struct StatusSnapshot {
     std::size_t queue_size = 0;
     std::size_t pending_commands = 0;   // "Pending" indicator (Q8)
     std::size_t deferred_count = 0;     // Q5: count only, no queue by default
+    std::size_t failed_count = 0;       // messages whose last action failed non-retryably (see failed()/retry())
     std::string last_error;             // redacted
 };
 
@@ -52,14 +53,21 @@ public:
     ~TriageSession();
 
     // Opens the store, recovers in-flight commands, resumes an active session or starts a new one (Q7).
-    // Never touches the network.
+    // It does NOT wait on the network: the only backend call is `backend.account()`, which for the Graph backend
+    // is a local token check (no request). If commands are Pending from an earlier run, start() makes ONE
+    // delivery attempt (flush) and ignores its errors; a Network error leaves them Pending.
     Status start();
 
-    // Attempts a manual inbound refresh if eligible. Returns Policy error with next_eligible when blocked (A02).
-    // On success the cooldown clock starts (A01). Partial failures are resumable and consume no cooldown (A07).
+    // Manual inbound refresh. First flushes pending outgoing commands (independent of the cooldown), then, if
+    // the cooldown allows, syncs. Returns a Policy error with next_eligible when blocked (A02). On success the
+    // cooldown clock starts (A01); partial failures are resumable and consume no cooldown (A07).
+    // Allowed from Offline: "offline" is only a belief. A success clears it (Offline -> Active), a failure
+    // keeps it. A Network/Auth/Throttled error from the flush step is returned without attempting the sync.
     Outcome<SyncReport> refresh(bool force = false);
 
-    // Pushes pending outgoing commands now. Independent of the inbound cooldown (A03-A05).
+    // Pushes pending outgoing commands now. Independent of the inbound cooldown (A03-A05). Always attempts
+    // delivery; a Network error leaves commands Pending and reports went_offline. Any server answer clears the
+    // offline flag.
     ProcessReport flush();
 
     // Queue and detail
@@ -67,12 +75,23 @@ public:
     Outcome<MessageBody> open(const std::string& message_id);   // cached body or fetch (not cooldown-limited: it is one message on demand)
     std::optional<MessageSummary> message(const std::string& message_id) const;
 
-    // DDD actions. Each enqueues durably and, if online, flushes immediately. Returns the command.
+    // DDD actions. Each enqueues durably and flushes immediately (a Network error just leaves the command Pending;
+    // only an explicit set_online(false) hint suppresses the attempt). Returns the command.
     Outcome<Command> archive(const std::string& message_id);     // Do
     Outcome<Command> remove(const std::string& message_id);      // Delete (soft)
     Outcome<Command> defer(const std::string& message_id);       // Defer
     Outcome<Command> undefer(const std::string& message_id);     // restore (Q5 explicit mechanism)
     Outcome<Command> undo(const std::string& command_id);        // compensating move for Confirmed archive/delete
+
+    // Failed actions. A message is Failed after a non-retryable error (Malformed, Invalid, NotFound with a Graph
+    // code other than ErrorItemNotFound, Policy). Retryable errors (Network, Server, Conflict, Forbidden,
+    // Throttled, a code-less 404) never fail a command: they stay Pending with capped exponential backoff.
+    std::vector<MessageSummary> failed() const;                      // newest first
+    std::optional<Command> failed_command(const std::string& message_id) const;  // most recent Failed command
+    std::string failure_reason(const std::string& message_id) const;  // its last_error (redacted), "" if none
+    // Re-enqueues the same CommandType as the last Failed command for the message (allowed from Failed) and
+    // tries to deliver it. Invalid if the message is not Failed.
+    Outcome<Command> retry(const std::string& message_id);
 
     // Session activity (Q12)
     std::vector<ActivityRow> activity() const;
@@ -85,7 +104,11 @@ public:
     Status sign_out(bool wipe_cache);
 
     StatusSnapshot status() const;
-    void set_online(bool online);   // platform informs connectivity; affects whether actions auto-flush
+    // Explicit connectivity hint from the platform (nothing in production calls it). set_online(false) shows
+    // "offline" and stops act() from auto-flushing until set_online(true) or any successful network operation
+    // (flush/refresh); an explicit flush() or refresh() always attempts delivery. A Network error discovered by
+    // the app itself sets the offline FLAG but never gates delivery.
+    void set_online(bool online);
 
     Store& store() { return *store_; }
     MailBackend& backend() { return *backend_; }

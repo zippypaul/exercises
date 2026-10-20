@@ -24,11 +24,16 @@ json parse_object(const std::string& s) {
 
 std::string dump(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
 
-std::int64_t not_before_of(const Command& c) {
+// Wall-clock time before which the command must not be retried. A value further in the future than any backoff
+// we could have scheduled (max_backoff + the 1 h Retry-After cap) can only come from a wall clock that has since
+// moved backwards: it is clamped to "now" so a clock change never strands a command.
+std::int64_t not_before_of(const Command& c, std::int64_t now, const RetryPolicy& policy) {
     const json j = parse_object(c.payload_json);
     auto it = j.find("not_before");
-    if (it != j.end() && it->is_number_integer()) return it->get<std::int64_t>();
-    return 0;
+    if (it == j.end() || !it->is_number_integer()) return 0;
+    const std::int64_t nb = it->get<std::int64_t>();
+    const std::int64_t horizon = now + std::max(1, policy.max_backoff_seconds) + kMaxRetryAfterSeconds;
+    return nb > horizon ? 0 : nb;
 }
 
 EventType event_type_for(CommandType t) {
@@ -141,6 +146,27 @@ CommandProcessor::CommandProcessor(Store& store, MailBackend& backend, const Clo
 
 Outcome<Command> CommandProcessor::enqueue(const std::string& session_id, const std::string& message_id,
                                            CommandType type, const std::string& payload_json) {
+    return enqueue_impl(session_id, message_id, type, payload_json, false);
+}
+
+Outcome<Command> CommandProcessor::retry(const std::string& session_id, const std::string& message_id) {
+    auto invalid = [](const std::string& msg) { return Outcome<Command>(make_status(ErrorKind::Invalid, msg).error()); };
+    const auto state = store_.get_message_state(message_id);
+    if (!state) return invalid("unknown message");
+    if (*state != MessageState::Failed) return invalid("message has no failed action to retry");
+    const std::vector<Command> history = store_.list_commands_for_message(message_id);
+    for (auto it = history.rbegin(); it != history.rend(); ++it) {
+        if (it->state != CommandState::Failed) continue;
+        json payload = parse_object(it->payload_json);
+        payload.erase("not_before");
+        return enqueue_impl(session_id, message_id, it->type, dump(payload), true);
+    }
+    return invalid("no failed command to retry");
+}
+
+Outcome<Command> CommandProcessor::enqueue_impl(const std::string& session_id, const std::string& message_id,
+                                                CommandType type, const std::string& payload_json,
+                                                bool allow_failed_state) {
     auto invalid = [](const std::string& msg) { return Outcome<Command>(make_status(ErrorKind::Invalid, msg).error()); };
     try {
         json payload = parse_object(payload_json);
@@ -190,14 +216,14 @@ Outcome<Command> CommandProcessor::enqueue(const std::string& session_id, const 
         for (const auto& h : history) {
             if (is_active(h)) return invalid("another command is already pending for this message");
         }
-        bool state_ok = false;
+        bool state_ok = allow_failed_state && state == MessageState::Failed;
         switch (type) {
         case CommandType::Archive:
         case CommandType::Delete:
-        case CommandType::Defer: state_ok = state == MessageState::InQueue || state == MessageState::Failed; break;
-        case CommandType::Undefer: state_ok = state == MessageState::Deferred; break;
-        case CommandType::UndoArchive: state_ok = state == MessageState::Archived; break;
-        case CommandType::UndoDelete: state_ok = state == MessageState::Deleted; break;
+        case CommandType::Defer: state_ok |= state == MessageState::InQueue || state == MessageState::Failed; break;
+        case CommandType::Undefer: state_ok |= state == MessageState::Deferred; break;
+        case CommandType::UndoArchive: state_ok |= state == MessageState::Archived; break;
+        case CommandType::UndoDelete: state_ok |= state == MessageState::Deleted; break;
         }
         if (!state_ok) return invalid(std::string("action not allowed in message state ") + to_string(state));
 
@@ -254,10 +280,12 @@ std::size_t CommandProcessor::recover_in_flight() {
 
 ProcessReport CommandProcessor::process() {
     ProcessReport rep;
+    // A command left InFlight by a failed local write (or a crash) would otherwise never be looked at again.
+    (void)recover_in_flight();
     const std::vector<Command> queue = store_.list_commands(CommandState::Pending);
 
     for (Command cmd : queue) {
-        if (not_before_of(cmd) > clock_.now_wall()) {
+        if (not_before_of(cmd, clock_.now_wall(), policy_) > clock_.now_wall()) {
             ++rep.deferred_retry;
             continue;
         }
@@ -265,7 +293,10 @@ ProcessReport CommandProcessor::process() {
         if (!summary) {
             cmd.state = CommandState::Failed;
             cmd.last_error = "message not in cache";
-            (void)store_.put_command(cmd);
+            if (!store_.put_command(cmd).ok()) {
+                SLOWMAIL_LOG_ERROR("process: could not record a failed command; stopping");
+                break;
+            }
             ++rep.failed;
             continue;
         }
@@ -315,32 +346,54 @@ ProcessReport CommandProcessor::process() {
         }
         }
 
+        if (ex.error.kind != ErrorKind::Network && ex.error.kind != ErrorKind::Cancelled) rep.reached_server = true;
+
         bool stop = false;
-        const Status applied = ex.ok ? confirm_command(store_, clock_, cmd, ex.move) : Status();
         if (ex.ok) {
+            // The server has acted. If the local write fails, try once more; if it still fails put the command
+            // back to Pending (retrying is idempotent) rather than leaving it InFlight forever.
+            const Command before_confirm = cmd;
+            Status applied = confirm_command(store_, clock_, cmd, ex.move);
+            if (!applied.ok()) {
+                SLOWMAIL_LOG_WARN("process: confirmed on server but local store update failed; retrying once");
+                cmd = before_confirm;
+                applied = confirm_command(store_, clock_, cmd, ex.move);
+            }
             if (applied.ok()) {
                 ++rep.confirmed;
-            } else {
-                SLOWMAIL_LOG_ERROR("process: confirmed on server but local store update failed");
-                stop = true;
+                continue;
             }
-            if (stop) break;
-            continue;
+            SLOWMAIL_LOG_ERROR("process: confirmed on server but local store update failed twice; command back to pending");
+            cmd = before_confirm;
+            cmd.state = CommandState::Pending;
+            cmd.last_error = "confirmed on server; local update failed, will retry";
+            if (!store_.put_command(cmd).ok()) {
+                SLOWMAIL_LOG_ERROR("process: could not return the command to pending; left for recover_in_flight");
+            }
+            ++rep.deferred_retry;
+            break;
         }
 
         const Error& err = ex.error;
         const std::string redacted = redact(err.message);
         const std::int64_t now = clock_.now_wall();
 
-        auto park_pending = [&](std::int64_t wait_seconds) {
+        // Writes the command back as Pending; a failed write leaves it InFlight, which recover_in_flight() repairs.
+        auto write_pending = [&]() -> bool {
+            Status s = store_.put_command(cmd);
+            if (!s.ok()) s = store_.put_command(cmd);
+            if (!s.ok()) SLOWMAIL_LOG_ERROR("process: could not write a pending command; stopping");
+            return s.ok();
+        };
+        auto park_pending = [&](std::int64_t wait_seconds) -> bool {
             json payload = parse_object(cmd.payload_json);
             payload["not_before"] = now + wait_seconds;
             cmd.payload_json = dump(payload);
             cmd.state = CommandState::Pending;
             cmd.last_error = redacted;
-            (void)store_.put_command(cmd);
+            return write_pending();
         };
-        auto fail_command = [&](const std::string& reason) {
+        auto fail_command = [&](const std::string& reason) -> bool {
             Transaction tx(store_);
             cmd.state = CommandState::Failed;
             cmd.last_error = redacted;
@@ -348,13 +401,24 @@ ProcessReport CommandProcessor::process() {
             if (s.ok()) s = store_.set_message_state(cmd.message_id, MessageState::Failed, reason);
             if (s.ok()) s = detail::update_event_for_command(store_, cmd.session_id, cmd.id, ConfirmationState::Failed, reason);
             if (s.ok()) s = detail::touch_session_item(store_, cmd.session_id, cmd.message_id, MessageState::InQueue, MessageState::Failed, reason);
-            if (s.ok()) (void)tx.commit();
+            if (s.ok()) s = tx.commit();
+            if (!s.ok()) {
+                SLOWMAIL_LOG_ERROR("process: could not record a failed command; stopping");
+                return false;
+            }
             ++rep.failed;
+            return true;
+        };
+        // Retryable with exponential backoff, capped at max_backoff_seconds. Never fails by attempt count.
+        auto retry_later = [&]() -> bool {
+            const bool ok = park_pending(backoff_seconds(policy_, cmd.attempts));
+            if (ok) ++rep.deferred_retry;
+            return ok;
         };
 
         switch (err.kind) {
         case ErrorKind::NotFound:
-            if (err.code.empty() || err.code == "ErrorItemNotFound") {
+            if (err.code == "ErrorItemNotFound") {
                 Transaction tx(store_);
                 cmd.state = CommandState::Abandoned;
                 cmd.last_error = kGoneReason;
@@ -362,17 +426,24 @@ ProcessReport CommandProcessor::process() {
                 if (s.ok()) s = store_.mark_gone(cmd.message_id);
                 if (s.ok()) s = detail::update_event_for_command(store_, cmd.session_id, cmd.id, ConfirmationState::Failed, "already gone");
                 if (s.ok()) s = detail::touch_session_item(store_, cmd.session_id, cmd.message_id, MessageState::InQueue, MessageState::GoneOnServer, "");
-                if (s.ok()) (void)tx.commit();
-                ++rep.abandoned;
+                if (s.ok()) s = tx.commit();
+                if (s.ok()) {
+                    ++rep.abandoned;
+                } else {
+                    SLOWMAIL_LOG_ERROR("process: could not record an abandoned command; stopping");
+                    stop = true;
+                }
+            } else if (err.code.empty()) {
+                // A 404 without a Graph error code (proxy, captive portal, routing): not proof the message is gone.
+                if (!retry_later()) stop = true;
             } else {
-                fail_command(err.code);  // e.g. ErrorFolderNotFound: a configuration problem, not a gone message
+                if (!fail_command(err.code)) stop = true;  // e.g. ErrorFolderNotFound: a configuration problem
             }
             break;
         case ErrorKind::Throttled: {
             const int bo = backoff_seconds(policy_, cmd.attempts);
             const int ra = std::min(err.retry_after_seconds.value_or(0), kMaxRetryAfterSeconds);
-            park_pending(std::max(ra, bo));
-            ++rep.deferred_retry;
+            if (park_pending(std::max(ra, bo))) ++rep.deferred_retry;
             if (err.retry_after_seconds) {
                 rep.retry_after_seconds = std::max(rep.retry_after_seconds.value_or(0), *err.retry_after_seconds);
             }
@@ -384,8 +455,7 @@ ProcessReport CommandProcessor::process() {
             cmd.attempts = std::max(0, cmd.attempts - 1);  // never reached the server
             cmd.state = CommandState::Pending;
             cmd.last_error = redacted;
-            (void)store_.put_command(cmd);
-            ++rep.deferred_retry;
+            if (write_pending()) ++rep.deferred_retry;
             if (err.kind == ErrorKind::Network) rep.went_offline = true;
             stop = true;
             break;
@@ -393,22 +463,18 @@ ProcessReport CommandProcessor::process() {
             cmd.attempts = std::max(0, cmd.attempts - 1);
             cmd.state = CommandState::Pending;
             cmd.last_error = redacted;
-            (void)store_.put_command(cmd);
-            ++rep.deferred_retry;
+            if (write_pending()) ++rep.deferred_retry;
             rep.auth_required = true;
             stop = true;
             break;
         case ErrorKind::Conflict:
         case ErrorKind::Server:
-            if (cmd.attempts >= policy_.max_attempts) {
-                fail_command(err.code.empty() ? to_string(err.kind) : err.code);
-            } else {
-                park_pending(backoff_seconds(policy_, cmd.attempts));
-                ++rep.deferred_retry;
-            }
+        case ErrorKind::Forbidden:
+            // Outages and consent/conditional-access hiccups clear up; keep the command and back off.
+            if (!retry_later()) stop = true;
             break;
         default:
-            fail_command(err.code.empty() ? to_string(err.kind) : err.code);
+            if (!fail_command(err.code.empty() ? to_string(err.kind) : err.code)) stop = true;
             break;
         }
         if (stop) break;

@@ -100,6 +100,7 @@ bool SessionStateMachine::can_attempt_sync(SessionState s) {
     case S::SyncEligible:
     case S::SyncPartial:
     case S::Active:
+    case S::Offline:  // "offline" is only a belief; a refresh is the way to find out (failure stays Offline)
         return true;
     default:
         return false;

@@ -265,17 +265,34 @@ TEST(CommandProcessor, CrashRecoveryWhenServerAlreadyActedIsAbandonedNotDuplicat
     EXPECT_TRUE(e.backend.calls.empty());
 }
 
-TEST(CommandProcessor, NotFoundWithItemNotFoundOrEmptyCodeMeansGone) {
+TEST(CommandProcessor, NotFoundWithItemNotFoundMeansGone) {
     Env e;
-    e.enqueue("m1", CommandType::Archive);
-    e.backend.fail_next(ErrorKind::NotFound, std::nullopt, "move", 1, "");
-    EXPECT_EQ(e.commands->process().abandoned, 1u);
-    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::GoneOnServer);
-
     e.enqueue("m2", CommandType::Delete);
     e.backend.fail_next(ErrorKind::NotFound, std::nullopt, "move", 1, "ErrorItemNotFound");
     EXPECT_EQ(e.commands->process().abandoned, 1u);
     EXPECT_EQ(e.store.get_message_state("m2"), MessageState::GoneOnServer);
+}
+
+// F5: a 404 without a Graph error code (proxy, captive portal, routing) is not proof the message is gone.
+TEST(CommandProcessor, NotFoundWithEmptyCodeIsATransientRetriedWithBackoff) {
+    Env e;
+    Command c = e.enqueue("m1", CommandType::Archive);
+    const std::int64_t t = e.clock.now_wall();
+    e.backend.fail_next(ErrorKind::NotFound, std::nullopt, "move", 1, "");
+    ProcessReport r = e.commands->process();
+    EXPECT_EQ(r.abandoned, 0u);
+    EXPECT_EQ(r.failed, 0u);
+    EXPECT_EQ(r.deferred_retry, 1u);
+    EXPECT_EQ(e.cmd(c.id).state, CommandState::Pending);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::DoPending) << "never tombstoned on a code-less 404";
+    EXPECT_EQ(Env::not_before(e.cmd(c.id)), t + 2);
+    // Inside the backoff window nothing is sent; afterwards it goes through.
+    e.backend.clear_calls();
+    EXPECT_EQ(e.commands->process().confirmed, 0u);
+    EXPECT_TRUE(e.backend.calls.empty());
+    e.clock.advance(2);
+    EXPECT_EQ(e.commands->process().confirmed, 1u);
+    EXPECT_TRUE(e.backend.in_archive("m1"));
 }
 
 TEST(CommandProcessor, NotFoundWithOtherCodeIsNonRetryableFailureNotGone) {
@@ -303,13 +320,29 @@ TEST(CommandProcessor, NotFoundWithOtherCodeIsNonRetryableFailureNotGone) {
     EXPECT_EQ(e.commands->process().confirmed, 1u);
 }
 
-TEST(CommandProcessor, ForbiddenFailsImmediately) {
+// F2(c): Forbidden is retryable with backoff, never failed by attempt count.
+TEST(CommandProcessor, ForbiddenStaysPendingWithBackoff) {
     Env e;
     Command c = e.enqueue("m1", CommandType::Delete);
+    const std::int64_t t = e.clock.now_wall();
     e.backend.fail_next(ErrorKind::Forbidden, std::nullopt, "move");
-    EXPECT_EQ(e.commands->process().failed, 1u);
-    EXPECT_EQ(e.cmd(c.id).state, CommandState::Failed);
-    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Failed);
+    ProcessReport r = e.commands->process();
+    EXPECT_EQ(r.failed, 0u);
+    EXPECT_EQ(r.deferred_retry, 1u);
+    EXPECT_EQ(e.cmd(c.id).state, CommandState::Pending);
+    EXPECT_EQ(Env::not_before(e.cmd(c.id)), t + 2);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::DeletePending);
+}
+
+TEST(CommandProcessor, NonRetryableKindsFailImmediately) {
+    for (ErrorKind k : {ErrorKind::Malformed, ErrorKind::Invalid, ErrorKind::Policy}) {
+        Env e;
+        Command c = e.enqueue("m1", CommandType::Delete);
+        e.backend.fail_next(k, std::nullopt, "move");
+        EXPECT_EQ(e.commands->process().failed, 1u) << to_string(k);
+        EXPECT_EQ(e.cmd(c.id).state, CommandState::Failed) << to_string(k);
+        EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Failed) << to_string(k);
+    }
 }
 
 // A09 / Q8
@@ -384,31 +417,43 @@ TEST(CommandProcessor, ShortRetryAfterIsRaisedToExponentialBackoff) {
     EXPECT_EQ(Env::not_before(e.cmd(c.id)), now + 4) << "max(retry_after=1, backoff=4)";
 }
 
-TEST(CommandProcessor, ServerErrorsBackOffExponentiallyThenFailAfterMaxAttempts) {
+// F2(c): a long outage never hides mail. Backoff doubles up to max_backoff and the command stays Pending.
+TEST(CommandProcessor, ServerErrorsBackOffExponentiallyCappedAndNeverFail) {
     RetryPolicy p;
-    p.max_attempts = 3;
+    p.max_attempts = 3;  // legacy knob: no longer a limit
     p.base_backoff_seconds = 2;
-    p.max_backoff_seconds = 300;
+    p.max_backoff_seconds = 20;
     Env e(p);
     Command c = e.enqueue("m1", CommandType::Archive);
-    e.backend.fail_next(ErrorKind::Server, std::nullopt, "move", 10);
+    e.backend.fail_next(ErrorKind::Server, std::nullopt, "move", 100);
 
-    std::int64_t t = e.clock.now_wall();
-    e.commands->process();
+    const std::int64_t expected[] = {2, 4, 8, 16, 20, 20, 20, 20};
+    for (std::int64_t wait : expected) {
+        const std::int64_t t = e.clock.now_wall();
+        ProcessReport r = e.commands->process();
+        EXPECT_EQ(r.failed, 0u);
+        EXPECT_EQ(e.cmd(c.id).state, CommandState::Pending);
+        EXPECT_EQ(Env::not_before(e.cmd(c.id)), t + wait);
+        e.clock.advance(static_cast<double>(wait));
+    }
+    EXPECT_GT(e.cmd(c.id).attempts, 3);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::DoPending);
+}
+
+TEST(CommandProcessor, ServerOutageEndsAndCommandConfirms) {
+    RetryPolicy p;
+    p.base_backoff_seconds = 2;
+    p.max_backoff_seconds = 20;
+    Env e(p);
+    Command c = e.enqueue("m1", CommandType::Archive);
+    e.backend.fail_next(ErrorKind::Server, std::nullopt, "move", 12);
+    for (int i = 0; i < 12; ++i) {
+        e.commands->process();
+        e.clock.advance(20);
+    }
     EXPECT_EQ(e.cmd(c.id).state, CommandState::Pending);
-    EXPECT_EQ(Env::not_before(e.cmd(c.id)), t + 2);
-
-    e.clock.advance(2);
-    t = e.clock.now_wall();
-    e.commands->process();
-    EXPECT_EQ(Env::not_before(e.cmd(c.id)), t + 4);
-
-    e.clock.advance(4);
-    ProcessReport r = e.commands->process();
-    EXPECT_EQ(r.failed, 1u);
-    EXPECT_EQ(e.cmd(c.id).state, CommandState::Failed);
-    EXPECT_EQ(e.cmd(c.id).attempts, 3);
-    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Failed);
+    EXPECT_EQ(e.commands->process().confirmed, 1u);
+    EXPECT_EQ(e.cmd(c.id).state, CommandState::Confirmed);
 }
 
 TEST(CommandProcessor, ConflictStaysPendingOnceThenSucceeds) {
@@ -534,4 +579,148 @@ TEST(CommandProcessor, ProcessWithNothingPendingIsANoop) {
     EXPECT_EQ(r.confirmed + r.failed + r.abandoned + r.deferred_retry, 0u);
     EXPECT_FALSE(r.went_offline);
     EXPECT_TRUE(e.backend.calls.empty());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// F2: retry of a failed command
+// ---------------------------------------------------------------------------------------------------------------
+TEST(CommandProcessor, RetryReEnqueuesTheLastFailedCommandType) {
+    Env e;
+    Command c = e.enqueue("m1", CommandType::Delete);
+    e.backend.fail_next(ErrorKind::NotFound, std::nullopt, "move", 1, "ErrorFolderNotFound");
+    ASSERT_EQ(e.commands->process().failed, 1u);
+    ASSERT_EQ(e.store.get_message_state("m1"), MessageState::Failed);
+
+    auto r = e.commands->retry("s1", "m1");
+    ASSERT_TRUE(r.ok()) << r.error().message;
+    EXPECT_NE(r.value().id, c.id);
+    EXPECT_EQ(r.value().type, CommandType::Delete) << "same type as the failed command";
+    EXPECT_EQ(r.value().state, CommandState::Pending);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::DeletePending);
+    EXPECT_EQ(e.commands->process().confirmed, 1u);
+    EXPECT_TRUE(e.backend.in_deleted("m1"));
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Deleted);
+}
+
+TEST(CommandProcessor, RetryIsRejectedWhenNothingFailed) {
+    Env e;
+    EXPECT_EQ(e.commands->retry("s1", "m1").error().kind, ErrorKind::Invalid);   // InQueue
+    EXPECT_EQ(e.commands->retry("s1", "nope").error().kind, ErrorKind::Invalid);  // unknown
+}
+
+TEST(CommandProcessor, RetryWorksForUndeferWhichNormallyNeedsDeferredState) {
+    Env e;
+    e.enqueue("m1", CommandType::Defer);
+    ASSERT_EQ(e.commands->process().confirmed, 1u);
+    Command u = e.enqueue("m1", CommandType::Undefer);
+    e.backend.fail_next(ErrorKind::Malformed, std::nullopt, "flag");
+    ASSERT_EQ(e.commands->process().failed, 1u);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Failed);
+
+    auto r = e.commands->retry("s1", "m1");
+    ASSERT_TRUE(r.ok()) << r.error().message;
+    EXPECT_EQ(r.value().type, CommandType::Undefer);
+    EXPECT_NE(r.value().id, u.id);
+    EXPECT_EQ(e.commands->process().confirmed, 1u);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::InQueue);
+    EXPECT_EQ(e.backend.flag_of("m1"), FlagStatus::NotFlagged);
+}
+
+TEST(CommandProcessor, RetryOfAFailedUndoKeepsTheOriginalCommandReference) {
+    Env e;
+    e.enqueue("m1", CommandType::Archive);
+    ASSERT_EQ(e.commands->process().confirmed, 1u);
+    e.enqueue("m1", CommandType::UndoArchive);
+    e.backend.fail_next(ErrorKind::Malformed, std::nullopt, "move");
+    ASSERT_EQ(e.commands->process().failed, 1u);
+    auto r = e.commands->retry("s1", "m1");
+    ASSERT_TRUE(r.ok()) << r.error().message;
+    EXPECT_EQ(r.value().type, CommandType::UndoArchive);
+    EXPECT_EQ(e.commands->process().confirmed, 1u);
+    EXPECT_TRUE(e.backend.in_inbox("m1"));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// F7: local write failures around server confirmation
+// ---------------------------------------------------------------------------------------------------------------
+TEST(CommandProcessor, LocalWriteFailureAfterServerConfirmIsRetriedOnce) {
+    Env e;
+    Command c = e.enqueue("m1", CommandType::Archive);
+    e.backend.after_success = [&] { e.store.fail_next_write(); };
+    ProcessReport r = e.commands->process();
+    EXPECT_EQ(r.confirmed, 1u);
+    EXPECT_EQ(e.cmd(c.id).state, CommandState::Confirmed);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Archived);
+    EXPECT_EQ(e.event_for(c.id).confirmation, ConfirmationState::Confirmed);
+}
+
+TEST(CommandProcessor, LocalWriteFailingTwiceReturnsTheCommandToPendingNotInFlight) {
+    Env e;
+    Command c = e.enqueue("m1", CommandType::Archive);
+    e.backend.after_success = [&] { e.store.fail_next_writes(2); };
+    ProcessReport r = e.commands->process();
+    EXPECT_EQ(r.confirmed, 0u);
+    EXPECT_EQ(r.deferred_retry, 1u);
+    EXPECT_EQ(e.cmd(c.id).state, CommandState::Pending) << "never left InFlight forever";
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::DoPending);
+    EXPECT_TRUE(e.backend.in_archive("m1")) << "the server did act";
+
+    // The retry is idempotent: moving an already-archived message again confirms.
+    e.backend.after_success = nullptr;
+    EXPECT_EQ(e.commands->process().confirmed, 1u);
+    EXPECT_EQ(e.cmd(c.id).state, CommandState::Confirmed);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Archived);
+}
+
+TEST(CommandProcessor, ProcessRecoversCommandsLeftInFlight) {
+    Env e;
+    Command c = e.enqueue("m1", CommandType::Archive);
+    Command stuck = e.cmd(c.id);
+    stuck.state = CommandState::InFlight;
+    stuck.attempts = 1;
+    ASSERT_TRUE(e.store.put_command(stuck).ok());
+    ProcessReport r = e.commands->process();  // no start()-time recovery: process() itself recovers
+    EXPECT_EQ(r.confirmed, 1u);
+    EXPECT_EQ(e.cmd(c.id).state, CommandState::Confirmed);
+}
+
+TEST(CommandProcessor, FailedParkWriteStopsProcessingAndIsRecoveredNextTime) {
+    Env e;
+    Command c = e.enqueue("m1", CommandType::Archive);
+    e.backend.fail_next(ErrorKind::Server, std::nullopt, "move");
+    e.backend.on_injected_failure = [&] { e.store.fail_next_writes(2); };  // park_pending's write and its one retry
+    ProcessReport r = e.commands->process();
+    EXPECT_EQ(r.confirmed, 0u);
+    EXPECT_EQ(r.deferred_retry, 0u) << "not reported as parked when the write failed";
+    EXPECT_EQ(e.cmd(c.id).state, CommandState::InFlight);
+    e.backend.on_injected_failure = nullptr;
+    EXPECT_EQ(e.commands->process().confirmed, 1u) << "recover_in_flight at the top of process()";
+}
+
+TEST(CommandProcessor, FailedFailCommandWriteIsNotCountedAndRolledBack) {
+    Env e;
+    Command c = e.enqueue("m1", CommandType::Archive);
+    e.backend.fail_next(ErrorKind::NotFound, std::nullopt, "move", 1, "ErrorFolderNotFound");
+    e.backend.on_injected_failure = [&] { e.store.fail_next_write(); };
+    ProcessReport r = e.commands->process();
+    EXPECT_EQ(r.failed, 0u) << "the failure could not be recorded";
+    EXPECT_NE(e.store.get_message_state("m1"), MessageState::Failed);
+    EXPECT_EQ(e.cmd(c.id).state, CommandState::InFlight);
+    e.backend.on_injected_failure = nullptr;
+    EXPECT_EQ(e.commands->process().confirmed, 1u);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// F12: not_before is clamped on read
+// ---------------------------------------------------------------------------------------------------------------
+TEST(CommandProcessor, NotBeforeFarInTheFutureIsTreatedAsNow) {
+    Env e;  // max_backoff 300 s: anything beyond now + 300 + 3600 cannot have been scheduled by us
+    const std::int64_t now = e.clock.now_wall();
+    Command far = e.enqueue("m1", CommandType::Archive, "{\"not_before\":" + std::to_string(now + 10 * 365 * 86400) + "}");
+    Command near_ = e.enqueue("m2", CommandType::Archive, "{\"not_before\":" + std::to_string(now + 600) + "}");
+    ProcessReport r = e.commands->process();
+    EXPECT_EQ(r.confirmed, 1u);
+    EXPECT_EQ(r.deferred_retry, 1u);
+    EXPECT_EQ(e.cmd(far.id).state, CommandState::Confirmed) << "a wall clock that moved backwards must not strand it";
+    EXPECT_EQ(e.cmd(near_.id).state, CommandState::Pending) << "a plausible backoff is still honoured";
 }

@@ -10,13 +10,15 @@ namespace slowmail::core {
 
 // Four-hour inbound refresh policy (handover §6).
 //   can_refresh = first_download || pro_entitled || elapsed_since_success >= cooldown
-// elapsed is computed defensively:
-//   * if boot_id matches and mono readings are present -> use monotonic elapsed (clock-change proof)
-//   * else use wall elapsed; a NEGATIVE wall elapsed (clock moved backwards) is treated as
-//     "unknown" and, to avoid permanently locking the user, resolves to eligible once
-//     the wall clock is at least `cooldown` past the EARLIER of (last_complete_wall, now).
-//     In practice: backwards clock change => eligible. Forward clock change => eligible early.
-//     This is an accepted MVP limitation (RISKS.md R-COOLDOWN-CLOCK); server time is not trusted here.
+// The user is eligible when EITHER clock says the cooldown has elapsed (fail open, never lock out):
+//   * monotonic elapsed (same boot, readings present) >= cooldown. SystemClock's monotonic reading includes
+//     suspended time (CLOCK_BOOTTIME), so a sleeping device does not stretch the cooldown.
+//   * OR wall elapsed >= cooldown. A forward wall-clock change therefore bypasses the cooldown (accepted, D23;
+//     it also covers a monotonic source that stops during suspend, and reboots).
+// When the monotonic reading is unusable (other boot, missing, went backwards) only the wall clock decides, and
+// a NEGATIVE wall elapsed (clock moved backwards) resolves to eligible ("clock_anomaly").
+// With a usable monotonic reading a backwards wall clock does NOT unlock early: mono still has to elapse.
+// Accepted MVP limitation (RISKS.md R-COOLDOWN-CLOCK); server time is not trusted here.
 //   * failed or partial syncs never update last_complete_* and so never consume the cooldown.
 struct CooldownConfig {
     std::int64_t cooldown_seconds = 4 * 60 * 60;

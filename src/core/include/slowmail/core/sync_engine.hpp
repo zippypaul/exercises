@@ -33,8 +33,13 @@ struct SyncReport {
 //      - cached, state InQueue       -> update fields
 //      - cached, Deferred, flag now NotFlagged -> restore to InQueue (Q5 default), event Undeferred
 //      - cached, *Pending            -> update fields only; the command processor decides
-//      - cached, Archived/Deleted but still reported in Inbox -> treat server as truth: back to InQueue
-//        (someone moved it back), log once
+//      - cached, Archived/Deleted/GoneOnServer but still reported in the Inbox -> treat server as truth: back
+//        to InQueue (someone moved it back), log once. Only when the entry's parent_folder_id equals the stored
+//        setting "inbox_folder_id" (learned from the first full enumeration, majority value); with an unknown
+//        inbox id or an empty parent_folder_id the entry is trusted. A stale entry from another folder is ignored.
+//      - cached, Failed, still reported in the Inbox and without a Pending/InFlight command -> back to InQueue
+//        (Deferred again if a failed Undefer left it flagged)
+//    within a page, removals are applied BEFORE changed entries (removed and re-added = in the Inbox now)
 //    per removed id:
 //      - cached, any state           -> mark_gone, abandon pending commands for it (no resurrection)
 //  * on ErrorKind::Gone, clear delta_link/resume, run a full sync once; tombstone anything not seen

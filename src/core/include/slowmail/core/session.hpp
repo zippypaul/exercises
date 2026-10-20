@@ -26,7 +26,8 @@ public:
 
     // States in which cached mail may be read and actions may be queued.
     static bool can_process_mail(SessionState s);
-    // States in which an inbound refresh may be attempted (subject to cooldown).
+    // States in which an inbound refresh may be attempted (subject to cooldown). Includes Offline: a failed
+    // attempt simply leaves the session Offline, a successful one moves it back to Active.
     static bool can_attempt_sync(SessionState s);
 
 private:

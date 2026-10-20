@@ -57,7 +57,9 @@ public:
     Status clear_token_blob() override;
 
     // Test hooks
-    void fail_next_write(ErrorKind kind = ErrorKind::Storage) { fail_next_ = kind; }
+    void fail_next_write(ErrorKind kind = ErrorKind::Storage) { fail_next_ = kind; fail_count_ = 1; }
+    // Fail the next `count` data-writing calls (not just one).
+    void fail_next_writes(int count, ErrorKind kind = ErrorKind::Storage) { fail_next_ = kind; fail_count_ = count; }
 
 private:
     struct CachedMessage { MessageSummary summary; MessageState state = MessageState::InQueue; std::string reason; };
@@ -73,6 +75,7 @@ private:
     std::vector<SessionEvent> events_;
     std::optional<std::string> token_blob_;
     std::optional<ErrorKind> fail_next_;
+    int fail_count_ = 1;
     struct Snapshot;                       // state captured by begin(), restored by rollback()
     std::shared_ptr<Snapshot> snapshot_;
     std::recursive_mutex mu_;

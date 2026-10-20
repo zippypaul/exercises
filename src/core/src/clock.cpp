@@ -16,7 +16,14 @@ std::int64_t SystemClock::now_wall() const {
 }
 
 double SystemClock::now_mono() const {
+    // CLOCK_BOOTTIME keeps counting while the device is suspended (the Paper Pro suspends ~40 s after the last
+    // touch); CLOCK_MONOTONIC does not, which would stretch a four-hour cooldown over days of suspended time.
     timespec ts{};
+#ifdef CLOCK_BOOTTIME
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) == 0) {
+        return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+    }
+#endif
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         const auto d = std::chrono::steady_clock::now().time_since_epoch();
         return std::chrono::duration<double>(d).count();
