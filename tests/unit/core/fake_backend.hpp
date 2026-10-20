@@ -45,6 +45,10 @@ public:
     std::size_t page_size = 50;
     // Test hook: runs right after a move()/set_flag() succeeded on the "server", before the caller sees the result.
     std::function<void()> after_success;
+    // Test hook: entries appended to the NEXT incremental delta page, then cleared (stale / out-of-folder / removed
+    // entries that a real server may include).
+    std::vector<MessageSummary> extra_changed;
+    std::vector<std::string> extra_removed;
     // Test hook: runs when a scripted failure (fail_next) is delivered, before the caller sees the error.
     std::function<void()> on_injected_failure;
 
@@ -192,6 +196,10 @@ public:
             if (removed[id] || it == inbox.end()) page.removed_ids.push_back(id);
             else page.changed.push_back(it->second);
         }
+        for (auto& m : extra_changed) page.changed.push_back(m);
+        for (auto& id : extra_removed) page.removed_ids.push_back(id);
+        extra_changed.clear();
+        extra_removed.clear();
         if (end < order.size()) page.next_link = "inc:" + std::to_string(generation_) + ":" + std::to_string(start) + ":" + std::to_string(end_cursor) + ":" + std::to_string(end);
         else page.delta_link = "delta:" + std::to_string(generation_) + ":" + std::to_string(end_cursor);
         calls.push_back({"delta", link, "", true});

@@ -58,6 +58,89 @@ Item {
                 highlightMoveDuration: 0
                 model: triage.activityModel
 
+                // Failed actions first: they are never hidden, each can be retried.
+                header: Column {
+                    width: list.width
+                    height: triage.failedCount > 0 ? implicitHeight : 0
+                    visible: triage.failedCount > 0
+                    Rectangle {
+                        width: parent.width
+                        height: 84
+                        color: Theme.ink
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left
+                            anchors.leftMargin: Theme.margin
+                            text: "Failed"
+                            font.pixelSize: Theme.fontSubject
+                            font.bold: true
+                            color: Theme.paper
+                        }
+                    }
+                    Repeater {
+                        model: triage.failedModel
+                        delegate: Rectangle {
+                            id: frow
+                            required property string id
+                            required property string subject
+                            required property string from
+                            required property string action
+                            required property string reason
+                            width: list.width
+                            height: fcol.implicitHeight + 40
+                            color: Theme.paper
+                            ColumnLayout {
+                                id: fcol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.leftMargin: Theme.margin
+                                anchors.rightMargin: Theme.margin
+                                spacing: 8
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: frow.subject === "" ? "(no subject)" : frow.subject
+                                    textFormat: Text.PlainText
+                                    wrapMode: Text.Wrap
+                                    maximumLineCount: 2
+                                    elide: Text.ElideRight
+                                    font.pixelSize: Theme.fontSubject
+                                    color: Theme.ink
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 20
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: frow.from + "  \u2022  " + frow.action + " failed"
+                                        textFormat: Text.PlainText
+                                        elide: Text.ElideRight
+                                        font.pixelSize: Theme.fontBody
+                                        color: Theme.secondary
+                                    }
+                                    SMButton {
+                                        text: "Retry"
+                                        Layout.preferredWidth: 240
+                                        enabled: !triage.busy
+                                        onClicked: triage.retry(frow.id)
+                                    }
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    visible: frow.reason !== ""
+                                    text: "Reason: " + frow.reason
+                                    textFormat: Text.PlainText
+                                    wrapMode: Text.Wrap
+                                    font.pixelSize: Theme.fontBody
+                                    font.bold: true
+                                    color: Theme.ink
+                                }
+                            }
+                            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: Theme.border; color: Theme.ink }
+                        }
+                    }
+                }
+
                 section.property: "type"
                 section.criteria: ViewSection.FullString
                 section.delegate: Rectangle {
@@ -165,7 +248,7 @@ Item {
 
             Text {
                 anchors.centerIn: parent
-                visible: list.count === 0
+                visible: list.count === 0 && triage.failedCount === 0
                 text: "Nothing yet in this session."
                 font.pixelSize: Theme.fontSubject
                 color: Theme.ink

@@ -495,3 +495,162 @@ TEST(SyncEngine, NewFlaggedMessageStillEntersQueue) {
     ASSERT_TRUE(e.sync.run(false).complete);
     EXPECT_EQ(e.store.get_message_state("m1"), MessageState::InQueue);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// F6: folder-aware resurrection, removals before changes
+// ---------------------------------------------------------------------------------------------------------------
+TEST(SyncEngine, FirstFullEnumerationLearnsTheInboxFolderId) {
+    Env e;
+    EXPECT_FALSE(e.store.get_setting("inbox_folder_id").has_value());
+    ASSERT_TRUE(e.first_sync(3).complete);
+    EXPECT_EQ(e.store.get_setting("inbox_folder_id").value_or(""), "inbox");
+}
+
+TEST(SyncEngine, MajorityParentFolderWinsWhenTheFirstEnumerationHasAStrayEntry) {
+    Env e;
+    e.seed(4);
+    e.backend.inbox["m4"].parent_folder_id = "other";
+    ASSERT_TRUE(e.sync.run(false).complete);
+    EXPECT_EQ(e.store.get_setting("inbox_folder_id").value_or(""), "inbox");
+}
+
+TEST(SyncEngine, StaleChangedEntryFromAnotherFolderDoesNotResurrectArchivedRow) {
+    Env e;
+    ASSERT_TRUE(e.first_sync(2).complete);
+    e.enqueue("m1", CommandType::Archive);
+    ASSERT_EQ(e.commands.process().confirmed, 1u);
+    ASSERT_EQ(e.store.get_message_state("m1"), MessageState::Archived);
+
+    MessageSummary stale = FakeBackend::make_message("m1");
+    stale.parent_folder_id = "archive";  // e.g. a flag/read change reported for the message after it moved
+    stale.is_read = true;
+    e.backend.extra_changed.push_back(stale);
+    e.backend.other_client_update("m2", "touch");  // gives the delta something to report
+    SyncReport r = e.sync.run(true);
+    ASSERT_TRUE(r.complete);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Archived);
+    EXPECT_EQ(e.queue_ids(), (std::vector<std::string>{"m2"}));
+}
+
+TEST(SyncEngine, StaleEntryDoesNotResurrectDeletedOrGoneRows) {
+    Env e;
+    ASSERT_TRUE(e.first_sync(3).complete);
+    e.enqueue("m1", CommandType::Delete);
+    ASSERT_EQ(e.commands.process().confirmed, 1u);
+    e.backend.other_client_purge("m3");
+    ASSERT_TRUE(e.sync.run(true).complete);
+    ASSERT_EQ(e.store.get_message_state("m3"), MessageState::GoneOnServer);
+
+    for (const char* id : {"m1", "m3"}) {
+        MessageSummary stale = FakeBackend::make_message(id);
+        stale.parent_folder_id = "deleteditems";
+        e.backend.extra_changed.push_back(stale);
+    }
+    e.backend.other_client_update("m2", "touch");
+    ASSERT_TRUE(e.sync.run(true).complete);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Deleted);
+    EXPECT_EQ(e.store.get_message_state("m3"), MessageState::GoneOnServer);
+}
+
+TEST(SyncEngine, EntryFromTheInboxStillRestoresAndEmptyParentIsTrusted) {
+    Env e;
+    ASSERT_TRUE(e.first_sync(3).complete);
+    e.enqueue("m1", CommandType::Archive);
+    e.enqueue("m2", CommandType::Archive);
+    ASSERT_EQ(e.commands.process().confirmed, 2u);
+
+    MessageSummary back1 = FakeBackend::make_message("m1");   // parent "inbox"
+    MessageSummary back2 = FakeBackend::make_message("m2");
+    back2.parent_folder_id.clear();                           // unknown parent: previous behaviour
+    e.backend.extra_changed.push_back(back1);
+    e.backend.extra_changed.push_back(back2);
+    e.backend.other_client_update("m3", "touch");
+    ASSERT_TRUE(e.sync.run(true).complete);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::InQueue);
+    EXPECT_EQ(e.store.get_message_state("m2"), MessageState::InQueue);
+}
+
+TEST(SyncEngine, UnknownInboxFolderFallsBackToTrustingEveryChangedEntry) {
+    Env e;
+    ASSERT_TRUE(e.first_sync(2).complete);
+    e.enqueue("m1", CommandType::Archive);
+    ASSERT_EQ(e.commands.process().confirmed, 1u);
+    // Simulate a database from before the setting existed.
+    ASSERT_TRUE(e.store.set_setting("inbox_folder_id", "").ok());
+    MessageSummary stale = FakeBackend::make_message("m1");
+    stale.parent_folder_id = "archive";
+    e.backend.extra_changed.push_back(stale);
+    e.backend.other_client_update("m2", "touch");
+    ASSERT_TRUE(e.sync.run(true).complete);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::InQueue);
+}
+
+// A message both removed and changed in one page was removed and re-added: it is in the Inbox now.
+TEST(SyncEngine, RemovedAndChangedInOnePageMeansItIsInTheInbox) {
+    Env e;
+    ASSERT_TRUE(e.first_sync(2).complete);
+    e.backend.other_client_update("m2", "touch");
+    e.backend.extra_removed.push_back("m1");
+    e.backend.extra_changed.push_back(FakeBackend::make_message("m1", "Back again"));
+    ASSERT_TRUE(e.sync.run(true).complete);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::InQueue);
+    EXPECT_EQ(e.store.get_message("m1")->subject, "Back again");
+    EXPECT_EQ(e.queue_ids().size(), 2u);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// F2(d): Failed rows the server still reports in the Inbox
+// ---------------------------------------------------------------------------------------------------------------
+TEST(SyncEngine, FailedRowStillInTheInboxReturnsToQueueWhenNoCommandIsActive) {
+    Env e;
+    ASSERT_TRUE(e.first_sync(2).complete);
+    e.enqueue("m1", CommandType::Archive);
+    e.backend.fail_next(ErrorKind::Malformed, std::nullopt, "move");
+    ASSERT_EQ(e.commands.process().failed, 1u);
+    ASSERT_EQ(e.store.get_message_state("m1"), MessageState::Failed);
+    e.backend.other_client_update("m1", "changed");
+    ASSERT_TRUE(e.sync.run(true).complete);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::InQueue);
+}
+
+TEST(SyncEngine, FailedRowWithAPendingCommandStaysFailed) {
+    Env e;
+    ASSERT_TRUE(e.first_sync(2).complete);
+    e.enqueue("m1", CommandType::Archive);
+    e.backend.fail_next(ErrorKind::Malformed, std::nullopt, "move");
+    ASSERT_EQ(e.commands.process().failed, 1u);
+    ASSERT_TRUE(e.commands.retry("s1", "m1").ok());  // retry in progress: row is DoPending, command Pending
+    // Force the row back to Failed to model "Failed row + active command" and check the guard directly.
+    ASSERT_TRUE(e.store.set_message_state("m1", MessageState::Failed, "x").ok());
+    e.backend.other_client_update("m1", "changed");
+    ASSERT_TRUE(e.sync.run(true).complete);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Failed);
+}
+
+TEST(SyncEngine, FailedRowReportedFromAnotherFolderStaysFailed) {
+    Env e;
+    ASSERT_TRUE(e.first_sync(2).complete);
+    e.enqueue("m1", CommandType::Archive);
+    e.backend.fail_next(ErrorKind::Malformed, std::nullopt, "move");
+    ASSERT_EQ(e.commands.process().failed, 1u);
+    MessageSummary stale = FakeBackend::make_message("m1");
+    stale.parent_folder_id = "archive";
+    e.backend.extra_changed.push_back(stale);
+    e.backend.other_client_update("m2", "touch");
+    ASSERT_TRUE(e.sync.run(true).complete);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Failed);
+}
+
+TEST(SyncEngine, FailedUndeferThatLeftTheMessageFlaggedReturnsAsDeferred) {
+    Env e;
+    ASSERT_TRUE(e.first_sync(2).complete);
+    e.enqueue("m1", CommandType::Defer);
+    ASSERT_EQ(e.commands.process().confirmed, 1u);
+    e.enqueue("m1", CommandType::Undefer);
+    e.backend.fail_next(ErrorKind::Malformed, std::nullopt, "flag");
+    ASSERT_EQ(e.commands.process().failed, 1u);
+    ASSERT_EQ(e.store.get_message_state("m1"), MessageState::Failed);
+    e.backend.other_client_update("m1", "touch");  // still flagged on the server
+    ASSERT_TRUE(e.sync.run(true).complete);
+    EXPECT_EQ(e.store.get_message_state("m1"), MessageState::Deferred);
+}

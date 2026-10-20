@@ -29,11 +29,13 @@ struct Snapshot {
     QString nextEligibleAt;
     int pendingCount = 0;
     int deferredCount = 0;
+    int failedCount = 0;
     bool offline = false;
     bool signedIn = false;
     QString lastError;
     QVector<QVariantMap> queue;
     QVector<QVariantMap> activity;
+    QVector<QVariantMap> failed;     // messages whose last action failed non-retryably
 };
 
 // Minimal keyed list model over QVariantMap rows. Updates are diffed on the "id" key so that a ListView keeps its
@@ -71,6 +73,7 @@ public slots:
     void start();
     void refresh(bool force);
     void flush();
+    void retry(const QString& messageId);
     void open(const QString& id);
     void archive(const QString& id);
     void remove(const QString& id);
@@ -105,7 +108,8 @@ private:
     QTimer* pollTimer_ = nullptr;
     bool signingIn_ = false;
     graph::DeviceCodeChallenge challenge_;   // holds the secret device_code: never exposed, never logged
-    int pollIntervalSec_ = 5;
+    int pollIntervalSec_ = 5;   // always within [1, 300]; see pollIntervalMs()
+    int pollIntervalMs() const;
     qint64 deadlineMs_ = 0;
 };
 
@@ -118,6 +122,7 @@ class TriageController : public QObject {
     Q_PROPERTY(QString nextEligibleAt READ nextEligibleAt NOTIFY statusChanged)
     Q_PROPERTY(int pendingCount READ pendingCount NOTIFY statusChanged)
     Q_PROPERTY(int deferredCount READ deferredCount NOTIFY statusChanged)
+    Q_PROPERTY(int failedCount READ failedCount NOTIFY statusChanged)
     Q_PROPERTY(bool offline READ offline NOTIFY statusChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
@@ -128,6 +133,7 @@ class TriageController : public QObject {
     Q_PROPERTY(QString notice READ notice NOTIFY noticeChanged)
     Q_PROPERTY(QObject* queueModel READ queueModel CONSTANT)
     Q_PROPERTY(QObject* activityModel READ activityModel CONSTANT)
+    Q_PROPERTY(QObject* failedModel READ failedModel CONSTANT)
 
 public:
     // `ctx` may be null only in demo mode (see loadDemoData()).
@@ -141,6 +147,7 @@ public:
     QString nextEligibleAt() const { return snap_.nextEligibleAt; }
     int pendingCount() const { return snap_.pendingCount; }
     int deferredCount() const { return snap_.deferredCount; }
+    int failedCount() const { return snap_.failedCount; }
     bool offline() const { return snap_.offline; }
     bool busy() const { return jobs_ > 0; }
     QString lastError() const { return lastError_; }
@@ -151,11 +158,13 @@ public:
     QString notice() const { return notice_; }
     QObject* queueModel() { return &queueModel_; }
     QObject* activityModel() { return &activityModel_; }
+    QObject* failedModel() { return &failedModel_; }
 
     // Opens the store and starts/resumes the session (worker thread). Never touches the network.
     Q_INVOKABLE void startSession();
     Q_INVOKABLE void refresh();
-    Q_INVOKABLE void flush();
+    Q_INVOKABLE void flush();                        // "Send pending (N)": one delivery attempt, no cooldown
+    Q_INVOKABLE void retry(const QString& messageId); // re-run the action that failed for this message
     Q_INVOKABLE void openMessage(const QString& id);
     Q_INVOKABLE void archive(const QString& id);
     Q_INVOKABLE void remove(const QString& id);
@@ -208,6 +217,7 @@ private:
     TriageWorker* worker_ = nullptr;
     RowModel queueModel_;
     RowModel activityModel_;
+    RowModel failedModel_;
     Snapshot snap_;
     bool ready_ = false;
     bool demo_ = false;

@@ -259,7 +259,9 @@ TEST(HtmlToText, OneMegabyteInputIsFast) {
     bool truncated = false;
     const std::string out = html_to_text(big, 200000, truncated);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    EXPECT_LT(ms, 1000);
+    const char* scale_env = std::getenv("SLOWMAIL_TEST_TIME_SCALE");
+    const double scale = scale_env ? std::atof(scale_env) : 1.0;
+    EXPECT_LT(static_cast<double>(ms), 1000.0 * (scale > 0 ? scale : 1.0));
     EXPECT_TRUE(truncated);
     EXPECT_LE(out.size(), 200000u);
     EXPECT_TRUE(valid_utf8(out));

@@ -32,7 +32,7 @@ How to read the evidence tags: VERIFIED / UNVERIFIED / FALSIFIED have the meanin
 | D20 | - | Defer = follow-up flag + local suppression; unflag elsewhere restores to queue | Engineering | Adopted |
 | D21 | - | NotFound: `ErrorItemNotFound` => already gone, never retried; other 404 codes => failed | Engineering | Adopted |
 | D22 | - | Partial delta updates are resolved in the Graph adapter by a follow-up GET | Engineering | Adopted |
-| D23 | - | Cooldown clock: monotonic within a boot, wall across boots, anomalies fail open | Engineering | Adopted |
+| D23 | - | Cooldown clock: BOOTTIME monotonic or wall, whichever says elapsed; anomalies fail open | Engineering | Adopted (revised) |
 | D24 | - | Device launch: MVP targets takeover (route A) for the Stage 1 gate; AppLoad native QML (route B) is the likely long-term path | Engineering | Adopted |
 
 Tonight's scope (2026-10-20), also decided by the owner: no pull request, no monetisation code, no device modification. Build target is the Qt-free C++17 core, SQLite storage, Graph adapter, Python fake Graph server, contract tests and a Qt 6.4 Quick UI compiled on the Ubuntu host (desktop simulator). The device cross-compile is scripted but UNTESTED on hardware, because this environment has no SDK and cannot reach developer.remarkable.com.
@@ -195,9 +195,9 @@ Tonight's scope (2026-10-20), also decided by the owner: no pull request, no mon
 
 ## D23 - Cooldown clock strategy
 
-- **Decision.** Within one boot, the cooldown uses the monotonic clock, which a wall-clock change cannot move. Across boots it uses wall time. Anything anomalous (a backward wall jump, a monotonic clock that goes backwards, a missing reading) fails open: the user is allowed to refresh and is never locked out. Failed and partial syncs never update the stored timestamps.
+- **Decision (revised 2026-10-20 after review).** The monotonic reading comes from `CLOCK_BOOTTIME` (counts time spent in suspend; `CLOCK_MONOTONIC` fallback), because the Paper Pro suspends about 40 s after the last touch and a clock that stops in suspend would turn four hours of cooldown into four hours of screen-on time. The user is eligible when EITHER the monotonic elapsed time (same boot) OR the wall-clock elapsed time is at least the cooldown. Anything anomalous (a backward wall jump with no usable monotonic reading, a monotonic clock that goes backwards, a missing reading) fails open: the user is allowed to refresh and is never locked out. Failed and partial syncs never update the stored timestamps.
 - **Rationale.** Handover section 6 and A16 require that clock changes neither silently bypass the cooldown nor lock the user permanently. They cannot both be fully satisfied on a device without a trusted time source, and a permanent lock-out of a personal tool is the worse failure.
-- **Consequences.** Setting the wall clock forward and rebooting, or reinstalling, bypasses the cooldown (accepted, RISKS R-COOLDOWN-CLOCK). Setting the clock backward across a reboot makes the user eligible (reason `clock_anomaly`). The device clock may also be wrong after a long sleep (ASM-29). There is no server-time check, because that would need a network call that is itself the thing being limited.
+- **Consequences.** Setting the wall clock forward, even within a boot, bypasses the cooldown (accepted, RISKS R-COOLDOWN-CLOCK; the earlier "within a boot a wall change cannot bypass" property was given up in favour of never locking the user out). Setting the clock backward across a reboot makes the user eligible (reason `clock_anomaly`). The device clock may also be wrong after a long sleep (ASM-29). There is no server-time check, because that would need a network call that is itself the thing being limited.
 - **How to revisit.** If a trusted time source becomes available on the device, or if the cooldown becomes a paid-tier control.
 
 ## D24 - Device launch route: takeover first, AppLoad native QML later

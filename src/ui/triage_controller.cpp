@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QLocale>
 #include <QMetaObject>
+#include <QRegularExpression>
 #include <QSet>
 
 #include <algorithm>
@@ -48,6 +49,16 @@ QString describeError(const core::Error& e) {
     const QString detail = q(e.message);
     if (head.isEmpty()) return detail.isEmpty() ? QStringLiteral("Something went wrong.") : detail;
     return detail.isEmpty() ? head : head + QLatin1Char(' ') + detail;
+}
+
+// Poll/begin refused for policy reasons (Conditional Access, app registration, consent): show a distinct message
+// with the AADSTS code when the adapter supplied one. The code is only shown if it has the expected shape.
+QString signInBlockedMessage(const core::Error& e) {
+    QString msg = QStringLiteral("Your organisation blocks this sign-in method");
+    const QString code = q(e.code);
+    static const QRegularExpression re(QStringLiteral("^AADSTS[0-9]{1,8}$"));
+    if (re.match(code).hasMatch()) msg += QStringLiteral(" (%1)").arg(code);
+    return msg + QStringLiteral(". Ask your admin; there is no workaround in Slow Mail.");
 }
 
 QString formatNextEligible(std::int64_t epoch) {
@@ -194,6 +205,7 @@ Snapshot TriageWorker::makeSnapshot() {
     s.offline = st.offline;
     s.pendingCount = static_cast<int>(st.pending_commands);
     s.deferredCount = static_cast<int>(st.deferred_count);
+    s.failedCount = static_cast<int>(st.failed_count);
     s.lastError = q(st.last_error);
     s.refreshEligible = st.cooldown.eligible;
     if (st.cooldown.last_success_wall) {
@@ -215,6 +227,27 @@ Snapshot TriageWorker::makeSnapshot() {
         row.insert(QStringLiteral("isRead"), m.is_read);
         row.insert(QStringLiteral("flagged"), m.flag_status == core::FlagStatus::Flagged);
         s.queue.push_back(row);
+    }
+
+    for (const core::MessageSummary& m : session.failed()) {
+        QString action;
+        if (const auto c = session.failed_command(m.id)) {
+            switch (c->type) {
+                case core::CommandType::Archive: action = QStringLiteral("Archive"); break;
+                case core::CommandType::Delete: action = QStringLiteral("Delete"); break;
+                case core::CommandType::Defer: action = QStringLiteral("Defer"); break;
+                case core::CommandType::Undefer: action = QStringLiteral("Restore"); break;
+                case core::CommandType::UndoArchive: action = QStringLiteral("Undo archive"); break;
+                case core::CommandType::UndoDelete: action = QStringLiteral("Undo delete"); break;
+            }
+        }
+        QVariantMap row;
+        row.insert(QStringLiteral("id"), q(m.id));
+        row.insert(QStringLiteral("subject"), q(m.subject));
+        row.insert(QStringLiteral("from"), (m.from.name.empty() && m.from.address.empty()) ? QStringLiteral("(unknown sender)") : q(m.from.name.empty() ? m.from.address : m.from.name));
+        row.insert(QStringLiteral("action"), action);
+        row.insert(QStringLiteral("reason"), q(session.failure_reason(m.id)));
+        s.failed.push_back(row);
     }
 
     struct Tmp {
@@ -306,6 +339,12 @@ void TriageWorker::flush() {
     emitSnapshot();
 }
 
+void TriageWorker::retry(const QString& messageId) {
+    JobGuard g(this);
+    actionResult(ctx_->session().retry(messageId.toStdString()));
+    emitSnapshot();
+}
+
 void TriageWorker::open(const QString& id) {
     JobGuard g(this);
     auto r = ctx_->session().open(id.toStdString());
@@ -376,12 +415,13 @@ void TriageWorker::beginSignIn() {
     stopPolling();
     auto r = ctx_->auth()->begin();
     if (!r.ok()) {
-        emit signInFinished(false, describeError(r.error()));
-        emit errorOccurred(describeError(r.error()));
+        const QString msg = r.error().kind == core::ErrorKind::Forbidden ? signInBlockedMessage(r.error()) : describeError(r.error());
+        emit signInFinished(false, msg);
+        emit errorOccurred(msg);
         return;
     }
     challenge_ = r.value();
-    pollIntervalSec_ = challenge_.interval > 0 ? challenge_.interval : 5;
+    pollIntervalSec_ = qBound<int>(1, challenge_.interval > 0 ? challenge_.interval : 5, 300);
     deadlineMs_ = QDateTime::currentMSecsSinceEpoch() + static_cast<qint64>(challenge_.expires_in > 0 ? challenge_.expires_in : 900) * 1000;
     signingIn_ = true;
     emit errorOccurred(QString());
@@ -391,7 +431,13 @@ void TriageWorker::beginSignIn() {
         pollTimer_->setSingleShot(true);
         connect(pollTimer_, &QTimer::timeout, this, &TriageWorker::pollSignIn);
     }
-    pollTimer_->start(pollIntervalSec_ * 1000);
+    pollTimer_->start(pollIntervalMs());
+}
+
+int TriageWorker::pollIntervalMs() const {
+    // qint64 arithmetic and a hard clamp: a hostile or buggy interval from the server must not overflow an int.
+    const qint64 sec = qBound<qint64>(qint64(1), static_cast<qint64>(pollIntervalSec_), qint64(300));
+    return static_cast<int>(sec * 1000);
 }
 
 void TriageWorker::stopPolling() {
@@ -414,17 +460,22 @@ void TriageWorker::pollSignIn() {
     }
     auto r = ctx_->auth()->poll(challenge_);
     if (!r.ok()) {
+        if (r.error().kind == core::ErrorKind::Forbidden) {
+            stopPolling();
+            emit signInFinished(false, signInBlockedMessage(r.error()));
+            return;
+        }
         // Transient transport errors: keep polling until the code expires.
-        pollTimer_->start(pollIntervalSec_ * 1000);
+        pollTimer_->start(pollIntervalMs());
         return;
     }
     switch (r.value()) {
         case graph::PollResult::Pending:
-            pollTimer_->start(pollIntervalSec_ * 1000);
+            pollTimer_->start(pollIntervalMs());
             return;
         case graph::PollResult::SlowDown:
-            pollIntervalSec_ += 5;
-            pollTimer_->start(pollIntervalSec_ * 1000);
+            pollIntervalSec_ = qBound<int>(1, pollIntervalSec_ + 5, 300);
+            pollTimer_->start(pollIntervalMs());
             return;
         case graph::PollResult::Authorized: {
             stopPolling();
@@ -441,6 +492,10 @@ void TriageWorker::pollSignIn() {
         case graph::PollResult::Expired:
             stopPolling();
             emit signInFinished(false, QStringLiteral("The sign-in code expired. Start again."));
+            return;
+        case graph::PollResult::Blocked:
+            stopPolling();
+            emit signInFinished(false, signInBlockedMessage(core::Error{}));
             return;
         case graph::PollResult::BadCode:
         case graph::PollResult::Error:
@@ -484,7 +539,8 @@ TriageController::TriageController(app::AppContext* ctx, QObject* parent)
       ctx_(ctx),
       queueModel_({"id", "subject", "fromName", "fromAddress", "receivedAt", "preview", "hasAttachments", "isRead", "flagged"}),
       activityModel_({"id", "type", "typeKey", "subject", "from", "time", "confirmation", "failureReason", "commandId",
-                      "messageId", "canUndo"}) {
+                      "messageId", "canUndo"}),
+      failedModel_({"id", "subject", "from", "action", "reason"}) {
     qRegisterMetaType<slowmail::ui::Snapshot>("slowmail::ui::Snapshot");
     if (!ctx_) return;   // demo mode
     worker_ = new TriageWorker(ctx_);
@@ -560,6 +616,7 @@ void TriageController::postWithBool(const char* slot, bool arg) {
 void TriageController::startSession() { post("start"); }
 void TriageController::refresh() { postWithBool("refresh", false); }
 void TriageController::flush() { post("flush"); }
+void TriageController::retry(const QString& messageId) { postWithString("retry", messageId); }
 void TriageController::openMessage(const QString& id) {
     if (demo_) {
         QTimer::singleShot(0, this, [this, id]() {
@@ -661,6 +718,7 @@ void TriageController::onSnapshot(const slowmail::ui::Snapshot& snap) {
     ready_ = true;
     queueModel_.setRows(snap.queue);
     activityModel_.setRows(snap.activity);
+    failedModel_.setRows(snap.failed);
     if (snap.lastError != sessionError_) {
         sessionError_ = snap.lastError;
         if (sessionError_.isEmpty()) dismissedError_.clear();
@@ -698,6 +756,7 @@ void TriageController::loadDemoData() {
     snap_.nextEligibleAt = QStringLiteral("05:42");
     snap_.pendingCount = 1;
     snap_.deferredCount = 2;
+    snap_.failedCount = 1;
     snap_.signedIn = true;
     userCode_ = QStringLiteral("B7QX-4MZ9");
     uri_ = QStringLiteral("https://microsoft.com/devicelogin");
@@ -735,6 +794,16 @@ void TriageController::loadDemoData() {
         act("a4", "Deferred", "deferred", "Budget questions", "Finance", "01:44", "Failed", "The message no longer exists on the server.", false),
     };
     activityModel_.setRows(snap_.activity);
+    {
+        QVariantMap f;
+        f.insert(QStringLiteral("id"), QStringLiteral("f1"));
+        f.insert(QStringLiteral("subject"), QStringLiteral("Budget questions"));
+        f.insert(QStringLiteral("from"), QStringLiteral("Finance"));
+        f.insert(QStringLiteral("action"), QStringLiteral("Defer"));
+        f.insert(QStringLiteral("reason"), QStringLiteral("ErrorFolderNotFound"));
+        snap_.failed = {f};
+        failedModel_.setRows(snap_.failed);
+    }
     ready_ = true;
     emit statusChanged();
 }

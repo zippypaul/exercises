@@ -408,15 +408,235 @@ TEST(TriageSession, NetworkErrorOnFlushMarksOfflineAndKeepsCommand) {
     EXPECT_EQ(st.session_state, SessionState::Offline);
     EXPECT_EQ(st.pending_commands, 1u);
 
-    // While offline further actions only queue (no network attempts).
+    // F1: offline is not sticky. Further actions still attempt delivery (and stay Pending while the net is down).
     const int calls = r.backend->count("move");
     ASSERT_TRUE(r.session->archive("m2").ok());
-    EXPECT_EQ(r.backend->count("move"), calls);
+    EXPECT_EQ(r.backend->count("move"), calls + 1) << "one attempt per action, stopping at the first Network error";
 
     r.backend->offline = false;
-    r.session->set_online(true);
+    ProcessReport pr = r.session->flush();  // no set_online() needed
+    EXPECT_EQ(pr.confirmed, 2u);
+    EXPECT_FALSE(r.session->status().offline);
     EXPECT_EQ(r.session->status().session_state, SessionState::Active);
-    EXPECT_EQ(r.session->flush().confirmed, 2u);
+}
+
+// F1: after one network blip the NEXT archive is delivered with no flush(), set_online() or refresh() in between.
+TEST(TriageSession, NextActionIsDeliveredAfterOneNetworkBlip) {
+    Rig r;
+    r.ready();
+    r.backend->fail_next(ErrorKind::Network, std::nullopt, "move");
+    auto a = r.session->archive("m1");
+    ASSERT_TRUE(a.ok());
+    EXPECT_EQ(a.value().state, CommandState::Pending);
+    EXPECT_TRUE(r.session->status().offline);
+    EXPECT_EQ(r.session->status().session_state, SessionState::Offline);
+
+    auto b = r.session->archive("m2");
+    ASSERT_TRUE(b.ok());
+    EXPECT_EQ(b.value().state, CommandState::Confirmed);
+    EXPECT_TRUE(r.backend->in_archive("m2"));
+    EXPECT_TRUE(r.backend->in_archive("m1")) << "the older pending command went out first (FIFO)";
+    StatusSnapshot st = r.session->status();
+    EXPECT_FALSE(st.offline) << "status.offline clears after a confirmed command";
+    EXPECT_EQ(st.session_state, SessionState::Active);
+    EXPECT_EQ(st.pending_commands, 0u);
+    EXPECT_TRUE(st.last_error.empty());
+}
+
+// F1: refresh is allowed from Offline, flushes first, and a success brings the session back to Active.
+TEST(TriageSession, RefreshFromOfflineFlushesThenSyncsAndClearsOffline) {
+    Rig r;
+    r.ready();
+    r.backend->offline = true;
+    ASSERT_TRUE(r.session->archive("m1").ok());
+    ASSERT_EQ(r.session->status().session_state, SessionState::Offline);
+    r.backend->add_message("m4", "New mail", 1'799'999'000);
+
+    // Still down: the refresh fails, the session stays Offline, nothing is lost.
+    r.clock->advance(4 * kHour);
+    auto down = r.session->refresh();
+    ASSERT_FALSE(down.ok());
+    EXPECT_EQ(down.error().kind, ErrorKind::Network);
+    EXPECT_EQ(r.session->status().session_state, SessionState::Offline);
+    EXPECT_TRUE(r.session->status().offline);
+    EXPECT_EQ(r.session->status().pending_commands, 1u);
+
+    r.backend->offline = false;
+    auto up = r.session->refresh();
+    ASSERT_TRUE(up.ok()) << up.error().message;
+    EXPECT_TRUE(up.value().complete);
+    EXPECT_TRUE(r.backend->in_archive("m1")) << "pending commands are flushed before the sync";
+    StatusSnapshot st = r.session->status();
+    EXPECT_EQ(st.session_state, SessionState::Active);
+    EXPECT_FALSE(st.offline);
+    EXPECT_EQ(st.pending_commands, 0u);
+    EXPECT_EQ(r.queue_ids(), (std::vector<std::string>{"m4", "m2", "m3"}));
+}
+
+TEST(TriageSession, RefreshFlushesPendingEvenWhenCooldownBlocksTheSync) {
+    Rig r;
+    r.ready();  // cooldown active: only one hour since the first sync
+    r.backend->fail_next(ErrorKind::Network, std::nullopt, "move");
+    ASSERT_TRUE(r.session->archive("m1").ok());
+    ASSERT_EQ(r.session->status().pending_commands, 1u);
+    auto res = r.session->refresh();
+    ASSERT_FALSE(res.ok());
+    EXPECT_EQ(res.error().kind, ErrorKind::Policy);
+    EXPECT_TRUE(r.backend->in_archive("m1"));
+    EXPECT_EQ(r.backend->count("delta"), 0);
+    EXPECT_EQ(r.session->status().session_state, SessionState::Active);
+    EXPECT_FALSE(r.session->status().offline);
+}
+
+TEST(TriageSession, FailedSyncWithNetworkErrorMarksOfflineAndASuccessfulFlushClearsIt) {
+    Rig r;
+    r.ready();
+    r.clock->advance(4 * kHour);
+    r.backend->fail_next(ErrorKind::Network, std::nullopt, "delta");
+    ASSERT_FALSE(r.session->refresh().ok());
+    EXPECT_TRUE(r.session->status().offline);
+    ASSERT_TRUE(r.session->archive("m1").ok());  // delivered: the net is fine
+    EXPECT_FALSE(r.session->status().offline);
+    EXPECT_TRUE(r.session->status().last_error.empty());
+}
+
+// Documented behaviour: start() makes one delivery attempt for leftover Pending commands and never blocks on
+// the network otherwise.
+TEST(TriageSession, StartFlushesLeftoverPendingOnceAndIgnoresNetworkErrors) {
+    auto store = std::make_unique<MemoryStore>();
+    MemoryStore* raw = store.get();
+    raw->upsert_message(FakeBackend::make_message("m1"));
+    raw->set_message_state("m1", MessageState::DoPending, "");
+    Command c;
+    c.id = "cmd-1";
+    c.session_id = "s";
+    c.message_id = "m1";
+    c.type = CommandType::Archive;
+    c.payload_json = "{}";
+    c.state = CommandState::Pending;
+    raw->put_command(c);
+    Rig r(0, {}, std::move(store));
+    r.backend->inbox["m1"] = FakeBackend::make_message("m1");
+    r.backend->offline = true;
+    ASSERT_TRUE(r.session->start().ok());
+    EXPECT_EQ(r.backend->count("move"), 1) << "exactly one attempt";
+    EXPECT_EQ(r.store->get_command("cmd-1")->state, CommandState::Pending);
+    EXPECT_TRUE(r.session->status().offline);
+
+    r.backend->offline = false;
+    r.backend->clear_calls();
+    ASSERT_TRUE(r.session->refresh().ok());  // refresh flushes first
+    EXPECT_EQ(r.store->get_command("cmd-1")->state, CommandState::Confirmed);
+}
+
+TEST(TriageSession, StartWithNothingPendingMakesNoNetworkCallBeyondAccount) {
+    Rig r;
+    ASSERT_TRUE(r.session->start().ok());
+    EXPECT_EQ(r.backend->count("move") + r.backend->count("flag") + r.backend->count("delta") + r.backend->count("body"), 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// F2: failed messages are listed, counted and retryable
+// ---------------------------------------------------------------------------------------------------------------
+TEST(TriageSession, FailedMessageIsListedCountedAndRetryable) {
+    Rig r;
+    r.ready();
+    r.backend->fail_next(ErrorKind::NotFound, std::nullopt, "move", 1, "ErrorFolderNotFound");
+    auto a = r.session->archive("m1");
+    ASSERT_TRUE(a.ok());
+    EXPECT_EQ(a.value().state, CommandState::Failed);
+    EXPECT_EQ(r.queue_ids(), (std::vector<std::string>{"m2", "m3"})) << "hidden from the queue ...";
+    ASSERT_EQ(r.session->failed().size(), 1u) << "... but listed under failed()";
+    EXPECT_EQ(r.session->failed()[0].id, "m1");
+    EXPECT_EQ(r.session->failure_reason("m1"), "fake backend: not_found");
+    ASSERT_TRUE(r.session->failed_command("m1").has_value());
+    EXPECT_EQ(r.session->failed_command("m1")->type, CommandType::Archive);
+    EXPECT_EQ(r.session->status().failed_count, 1u);
+    EXPECT_EQ(r.session->failure_reason("m2"), "");
+
+    auto again = r.session->retry("m1");
+    ASSERT_TRUE(again.ok()) << again.error().message;
+    EXPECT_EQ(again.value().type, CommandType::Archive);
+    EXPECT_EQ(again.value().state, CommandState::Confirmed);
+    EXPECT_TRUE(r.backend->in_archive("m1"));
+    EXPECT_TRUE(r.session->failed().empty());
+    EXPECT_EQ(r.session->status().failed_count, 0u);
+}
+
+TEST(TriageSession, RetryKeepsTheFailedActionTypeAndRejectsHealthyMessages) {
+    Rig r;
+    r.ready();
+    r.backend->fail_next(ErrorKind::Malformed, std::nullopt, "move");
+    ASSERT_EQ(r.session->remove("m1").value().state, CommandState::Failed);
+    EXPECT_EQ(r.session->retry("m2").error().kind, ErrorKind::Invalid);
+    auto again = r.session->retry("m1");
+    ASSERT_TRUE(again.ok());
+    EXPECT_EQ(again.value().type, CommandType::Delete);
+    EXPECT_TRUE(r.backend->in_deleted("m1"));
+}
+
+TEST(TriageSession, RetryWhilePendingBehindNetworkFailureStaysPending) {
+    Rig r;
+    r.ready();
+    r.backend->fail_next(ErrorKind::Malformed, std::nullopt, "move");
+    ASSERT_EQ(r.session->archive("m1").value().state, CommandState::Failed);
+    r.backend->offline = true;
+    auto again = r.session->retry("m1");
+    ASSERT_TRUE(again.ok());
+    EXPECT_EQ(again.value().state, CommandState::Pending);
+    EXPECT_EQ(r.session->status().failed_count, 0u) << "a retry in progress is Pending, not Failed";
+    EXPECT_EQ(r.session->status().pending_commands, 1u);
+}
+
+// F2(c) at the facade: a 5-minute Graph outage hides nothing and fails nothing.
+TEST(TriageSession, ServerOutageKeepsActionPendingUntilItClears) {
+    Rig r;
+    r.ready();
+    r.backend->fail_next(ErrorKind::Server, std::nullopt, "move", 4);
+    auto a = r.session->archive("m1");
+    ASSERT_TRUE(a.ok());
+    EXPECT_EQ(a.value().state, CommandState::Pending);
+    for (int i = 0; i < 3; ++i) {
+        r.clock->advance(30);  // each flush is past the backoff, and hits the outage again
+        r.session->flush();
+        EXPECT_EQ(r.session->status().failed_count, 0u);
+        EXPECT_EQ(r.session->status().pending_commands, 1u);
+    }
+    EXPECT_EQ(r.backend->count("move"), 4);
+    r.clock->advance(30);  // outage over
+    EXPECT_EQ(r.session->flush().confirmed, 1u);
+    EXPECT_TRUE(r.backend->in_archive("m1"));
+}
+
+// F2(d): a Failed row the server still reports in the Inbox comes back at the next sync.
+TEST(TriageSession, RefreshUnhidesFailedRowStillInTheInbox) {
+    Rig r;
+    r.ready();
+    r.backend->fail_next(ErrorKind::Malformed, std::nullopt, "move");
+    ASSERT_EQ(r.session->archive("m1").value().state, CommandState::Failed);
+    ASSERT_EQ(r.session->status().failed_count, 1u);
+    r.backend->other_client_update("m1", "Edited elsewhere");  // the server reports it again
+    r.clock->advance(4 * kHour);
+    ASSERT_TRUE(r.session->refresh().ok());
+    EXPECT_EQ(r.store->get_message_state("m1"), MessageState::InQueue);
+    EXPECT_EQ(r.session->status().failed_count, 0u);
+    EXPECT_EQ(r.queue_ids().size(), 3u);
+}
+
+TEST(TriageSession, RefreshDoesNotUnhideFailedRowWithAPendingCommand) {
+    Rig r;
+    r.ready();
+    r.backend->fail_next(ErrorKind::Malformed, std::nullopt, "move");
+    ASSERT_EQ(r.session->archive("m1").value().state, CommandState::Failed);
+    r.session->set_online(false);  // hint: queue the retry without sending it
+    ASSERT_TRUE(r.session->retry("m1").ok());
+    r.session->set_online(true);
+    r.backend->other_client_update("m1", "Edited elsewhere");
+    r.backend->fail_next(ErrorKind::Network, std::nullopt, "move");  // keep the retry from going out in refresh's flush
+    r.clock->advance(4 * kHour);
+    auto res = r.session->refresh();
+    ASSERT_FALSE(res.ok());  // flush hit the network error first
+    EXPECT_EQ(r.store->get_message_state("m1"), MessageState::DoPending);
 }
 
 TEST(TriageSession, ThrottledActionStaysPendingAndFlushLaterConfirms) {
@@ -537,7 +757,9 @@ TEST(TriageSession, PendingCommandsSurviveEndWhenOffline) {
     EXPECT_FALSE(r.backend->in_archive("m1"));
     EXPECT_EQ(r.store->list_commands(CommandState::Pending).size(), 1u);
 
+    r.backend->offline = true;  // still down when the next session starts: start() tries once and moves on
     ASSERT_TRUE(r.session->start().ok());
+    r.backend->offline = false;
     EXPECT_EQ(r.session->status().pending_commands, 1u);
     EXPECT_EQ(r.session->flush().confirmed, 1u);
     EXPECT_TRUE(r.backend->in_archive("m1"));
@@ -568,9 +790,10 @@ TEST(TriageSession, StartRecoversInFlightCommandsAndResumesActiveSession) {
 
     Rig r(0, {}, std::move(store));
     r.backend->inbox["m1"] = m;
+    r.backend->offline = true;  // keep start()'s single delivery attempt from sending it
     ASSERT_TRUE(r.session->start().ok());
+    r.backend->offline = false;
     EXPECT_EQ(r.session->status().session_id, "old-session");
-    EXPECT_EQ(r.session->status().session_state, SessionState::Active);
     EXPECT_EQ(r.store->get_command("cmd-1")->state, CommandState::Pending);
     EXPECT_EQ(r.session->status().pending_commands, 1u);
     ProcessReport pr = r.session->flush();
@@ -594,10 +817,9 @@ TEST(TriageSession, StartRecoveredCommandForMessageGoneOnServerIsAbandoned) {
     c.attempts = 1;
     raw->put_command(c);
     Rig r(0, {}, std::move(store));  // server has no m1
-    ASSERT_TRUE(r.session->start().ok());
-    ProcessReport pr = r.session->flush();
-    EXPECT_EQ(pr.abandoned, 1u);
+    ASSERT_TRUE(r.session->start().ok());  // start() sends the recovered command once: gone on the server
     EXPECT_EQ(r.store->get_command("cmd-1")->state, CommandState::Abandoned);
+    EXPECT_EQ(r.store->get_message_state("m1"), MessageState::GoneOnServer);
     EXPECT_EQ(r.session->status().pending_commands, 0u);
 }
 
@@ -635,12 +857,14 @@ TEST(TriageSession, ClockMovedBackwardNeverLocksTheUserOut) {
     EXPECT_TRUE(res.ok()) << (res.ok() ? "" : res.error().message);
 }
 
-TEST(TriageSession, RefreshWhileOfflineStateIsInvalidUntilBackOnline) {
+TEST(TriageSession, RefreshWhileOfflineStateIsAllowedFromTheHint) {
     Rig r;
     r.ready();
     r.session->set_online(false);
-    EXPECT_EQ(r.session->refresh(true).error().kind, ErrorKind::Invalid);
-    r.session->set_online(true);
+    EXPECT_EQ(r.session->status().session_state, SessionState::Offline);
     r.clock->advance(4 * kHour);
-    EXPECT_TRUE(r.session->refresh().ok());
+    auto res = r.session->refresh();
+    EXPECT_TRUE(res.ok()) << (res.ok() ? "" : res.error().message);
+    EXPECT_EQ(r.session->status().session_state, SessionState::Active);
+    EXPECT_FALSE(r.session->status().offline);
 }

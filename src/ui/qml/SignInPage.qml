@@ -45,6 +45,7 @@ Item {
                 font.pixelSize: Theme.fontBody
                 font.bold: true
                 color: Theme.ink
+                textFormat: Text.PlainText
                 text: triage.signInMessage
             }
             SMButton {
@@ -104,6 +105,7 @@ Item {
                 wrapMode: Text.Wrap
                 font.pixelSize: Theme.fontBody
                 color: Theme.ink
+                textFormat: Text.PlainText
                 text: triage.signInMessage
             }
             SMButton {

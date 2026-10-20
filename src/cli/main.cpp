@@ -31,7 +31,7 @@ void usage(std::FILE* out) {
         "Commands:\n"
         "  status                 Show session, cooldown and queue status\n"
         "  signin                 Device-code sign-in (prints code and URL, polls until done)\n"
-        "  refresh [--force]      Download the inbox (four-hour cooldown unless --force/pro)\n"
+        "  refresh [--force]      Send pending commands, then download the inbox (four-hour cooldown unless --force/pro)\n"
         "  queue [--json]         List the inbox processing queue\n"
         "  open <id>              Show sanitised body and attachment metadata\n"
         "  archive <id>           Do / Archive\n"
@@ -40,6 +40,8 @@ void usage(std::FILE* out) {
         "  undefer <id>           Restore a deferred message to the queue\n"
         "  undo <command-id>      Undo a confirmed archive/delete\n"
         "  flush                  Push pending outgoing commands now\n"
+        "  failed [--json]        List messages whose last action failed, with the reason\n"
+        "  retry <id>             Re-run the action that failed for a message\n"
         "  activity [--json]      Session activity\n"
         "  end                    End the session\n"
         "  signout [--wipe]       Sign out (optionally wipe the local cache)\n"
@@ -68,6 +70,17 @@ int exit_code_for(const core::Error& e) {
 void print_error(const core::Error& e) {
     std::fprintf(stderr, "error: %s%s%s\n", core::to_string(e.kind), e.message.empty() ? "" : ": ", e.message.c_str());
     if (exit_code_for(e) == kAuth) std::fprintf(stderr, "sign-in required: run `slowmail-cli signin`\n");
+}
+
+// A tenant policy (Conditional Access, app registration, consent) refused the sign-in. The AADSTS code, when the
+// adapter supplied one in the expected shape, is shown to help the admin.
+void print_sign_in_blocked(const core::Error& e) {
+    std::string code = e.code;
+    bool ok = code.rfind("AADSTS", 0) == 0 && code.size() > 6 && code.size() <= 14;
+    for (std::size_t i = 6; ok && i < code.size(); ++i) ok = code[i] >= '0' && code[i] <= '9';
+    std::fprintf(stderr,
+                 "Your organisation blocks this sign-in method%s%s%s. Ask your admin; there is no workaround in Slow Mail.\n",
+                 ok ? " (" : "", ok ? code.c_str() : "", ok ? ")" : "");
 }
 
 void print_next_eligible(core::TriageSession& s) {
@@ -106,6 +119,7 @@ int cmd_status(app::AppContext& ctx) {
     std::printf("queue: %zu\n", st.queue_size);
     std::printf("pending: %zu\n", st.pending_commands);
     std::printf("deferred: %zu\n", st.deferred_count);
+    std::printf("failed: %zu\n", st.failed_count);
     if (st.cooldown.last_success_wall) {
         std::printf("downloaded_at: %s local (%s)\n", app::format_local_hhmm(*st.cooldown.last_success_wall).c_str(),
                     core::format_iso8601_utc(*st.cooldown.last_success_wall).c_str());
@@ -122,6 +136,10 @@ int cmd_signin(app::AppContext& ctx) {
     auto auth = ctx.auth();
     auto begin = auth->begin();
     if (!begin.ok()) {
+        if (begin.error().kind == core::ErrorKind::Forbidden) {
+            print_sign_in_blocked(begin.error());
+            return kFail;
+        }
         print_error(begin.error());
         return kFail;
     }
@@ -137,6 +155,10 @@ int cmd_signin(app::AppContext& ctx) {
         std::this_thread::sleep_for(std::chrono::seconds(interval));
         auto r = auth->poll(ch);
         if (!r.ok()) {
+            if (r.error().kind == core::ErrorKind::Forbidden) {
+                print_sign_in_blocked(r.error());
+                return kFail;
+            }
             print_error(r.error());
             return kFail;
         }
@@ -164,6 +186,9 @@ int cmd_signin(app::AppContext& ctx) {
             case graph::PollResult::BadCode:
                 std::fprintf(stderr, "sign-in code rejected\n");
                 return kFail;
+            case graph::PollResult::Blocked:
+                print_sign_in_blocked(core::Error{});
+                return kFail;
             case graph::PollResult::Error:
                 std::fprintf(stderr, "sign-in failed\n");
                 return kFail;
@@ -178,7 +203,11 @@ int cmd_signin(app::AppContext& ctx) {
 int cmd_refresh(app::AppContext& ctx, const std::vector<std::string>& args) {
     auto& s = ctx.session();
     const bool force = has_flag(args, "--force");
+    // refresh() sends pending commands first (independent of the cooldown); say so when there was something to send.
+    const auto pending_before = s.status().pending_commands;
+    if (pending_before > 0) std::printf("pending commands: %zu (sending before the download)\n", pending_before);
     auto r = s.refresh(force);
+    if (pending_before > 0) std::printf("pending after send: %zu\n", s.status().pending_commands);
     if (!r.ok()) {
         const core::Error& e = r.error();
         if (e.kind == core::ErrorKind::Policy) {
@@ -293,6 +322,37 @@ int cmd_flush(app::AppContext& ctx) {
     return kOk;
 }
 
+int cmd_failed(app::AppContext& ctx, const std::vector<std::string>& args) {
+    auto& s = ctx.session();
+    const auto rows = s.failed();
+    if (has_flag(args, "--json")) {
+        json arr = json::array();
+        for (const auto& m : rows) {
+            const auto c = s.failed_command(m.id);
+            arr.push_back({{"id", m.id},
+                           {"subject", m.subject},
+                           {"from_name", m.from.name},
+                           {"from_address", m.from.address},
+                           {"action", c ? core::to_string(c->type) : ""},
+                           {"reason", s.failure_reason(m.id)}});
+        }
+        std::printf("%s\n", arr.dump(2).c_str());
+        return kOk;
+    }
+    if (rows.empty()) {
+        std::printf("no failed messages\n");
+        return kOk;
+    }
+    for (const auto& m : rows) {
+        const auto c = s.failed_command(m.id);
+        const std::string from = m.from.name.empty() ? m.from.address : m.from.name;
+        std::printf("%s\t%s\t%s\t%s\treason: %s\n", m.id.c_str(), c ? core::to_string(c->type) : "?",
+                    one_line(from).c_str(), one_line(m.subject).c_str(), one_line(s.failure_reason(m.id)).c_str());
+    }
+    std::printf("%zu failed message(s); `slowmail-cli retry <id>` re-runs the action\n", rows.size());
+    return kOk;
+}
+
 int cmd_activity(app::AppContext& ctx, const std::vector<std::string>& args) {
     const auto rows = ctx.session().activity();
     if (has_flag(args, "--json")) {
@@ -365,7 +425,7 @@ int main(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) args.emplace_back(argv[i]);
 
     static const char* const kKnown[] = {"status", "signin", "refresh", "queue", "open", "archive", "delete",
-                                         "defer", "undefer", "undo", "flush", "activity", "end", "signout"};
+                                         "defer", "undefer", "undo", "flush", "failed", "retry", "activity", "end", "signout"};
     bool known = false;
     for (const char* k : kKnown) if (cmd == k) known = true;
     if (!known) {
@@ -374,7 +434,7 @@ int main(int argc, char** argv) {
         return kFail;
     }
     const bool needs_id = cmd == "open" || cmd == "archive" || cmd == "delete" || cmd == "defer" ||
-                          cmd == "undefer" || cmd == "undo";
+                          cmd == "undefer" || cmd == "undo" || cmd == "retry";
     const std::string id = positional(args);
     if (needs_id && id.empty()) {
         std::fprintf(stderr, "%s: missing %s argument\n", cmd.c_str(), cmd == "undo" ? "<command-id>" : "<id>");
@@ -406,6 +466,8 @@ int main(int argc, char** argv) {
     else if (cmd == "undefer") rc = report_command(ctx->session().undefer(id));
     else if (cmd == "undo") rc = report_command(ctx->session().undo(id));
     else if (cmd == "flush") rc = cmd_flush(*ctx);
+    else if (cmd == "failed") rc = cmd_failed(*ctx, args);
+    else if (cmd == "retry") rc = report_command(ctx->session().retry(id));
     else if (cmd == "activity") rc = cmd_activity(*ctx, args);
     else if (cmd == "end") rc = cmd_end(*ctx);
     else if (cmd == "signout") rc = cmd_signout(*ctx, args);

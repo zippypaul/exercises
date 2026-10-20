@@ -43,10 +43,29 @@ Item {
                     font.pixelSize: Theme.fontTitle
                     font.bold: true
                     color: Theme.ink
+                    elide: Text.ElideRight
                     Layout.fillWidth: true
                 }
                 SMButton {
-                    Layout.preferredWidth: 520
+                    // Failed actions are never hidden: the count opens the Activity page, which lists them.
+                    visible: triage.failedCount > 0
+                    Layout.preferredWidth: 260
+                    Layout.preferredHeight: Theme.tap
+                    inverted: true
+                    text: "Failed " + triage.failedCount
+                    onClicked: page.showActivity()
+                }
+                SMButton {
+                    // One delivery attempt for queued actions, independent of the refresh cooldown.
+                    visible: triage.pendingCount > 0
+                    Layout.preferredWidth: 440
+                    Layout.preferredHeight: Theme.tap
+                    text: "Send pending (" + triage.pendingCount + ")"
+                    enabled: triage.signedIn && !triage.busy
+                    onClicked: triage.flush()
+                }
+                SMButton {
+                    Layout.preferredWidth: (triage.failedCount > 0 || triage.pendingCount > 0) ? 400 : 520
                     Layout.preferredHeight: Theme.tap
                     text: !triage.signedIn ? "Sign in"
                           : triage.refreshEnabled ? "Refresh"
@@ -99,6 +118,7 @@ Item {
                 Text {
                     visible: triage.notice !== ""
                     text: triage.notice
+                    textFormat: Text.PlainText
                     font.pixelSize: Theme.fontBody
                     color: Theme.secondary
                     elide: Text.ElideRight

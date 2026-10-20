@@ -1,6 +1,8 @@
 // Foundation tests: cooldown, session state machine, MemoryStore, Transaction.
 #include <gtest/gtest.h>
 
+#include <time.h>
+
 #include <set>
 
 #include "slowmail/core/clock.hpp"
@@ -139,19 +141,72 @@ TEST(Cooldown, WallForwardLessThanFourHoursAcrossRebootBlocked) {
     EXPECT_EQ(*d.next_eligible_wall, at("2026-10-20T06:00:00Z"));
 }
 
-TEST(Cooldown, MonoStillUsedWithinBootWhenWallJumpsForward) {
+// F3: the real monotonic clock must keep counting while the device is suspended (CLOCK_BOOTTIME on Linux).
+TEST(Cooldown, SystemClockMonoIsBoottimeOnLinux) {
+#ifdef CLOCK_BOOTTIME
+    SystemClock c;
+    timespec before{}, after{};
+    ASSERT_EQ(clock_gettime(CLOCK_BOOTTIME, &before), 0);
+    const double m = c.now_mono();
+    ASSERT_EQ(clock_gettime(CLOCK_BOOTTIME, &after), 0);
+    const double lo = static_cast<double>(before.tv_sec) + before.tv_nsec / 1e9;
+    const double hi = static_cast<double>(after.tv_sec) + after.tv_nsec / 1e9;
+    EXPECT_GE(m, lo);
+    EXPECT_LE(m, hi);
+#else
+    GTEST_SKIP() << "no CLOCK_BOOTTIME on this platform";
+#endif
+}
+
+// F3: either clock reaching the cooldown unlocks (fail open). A forward wall change bypasses the cooldown (D23).
+TEST(Cooldown, WallJumpForwardWithinBootIsEligibleEvenIfMonoSaysOtherwise) {
     FakeClock clock(at("2026-10-20T02:00:00Z"));
     CooldownPolicy policy;
     InboxSyncState st;
     CooldownPolicy::record_success(st, clock);
-    clock.advance(1 * kHour);                      // mono +1h
-    clock.set_wall(clock.now_wall() + 4 * kHour);  // user jumps wall clock: total wall +5h
+    clock.advance(10 * 60);                        // mono +10 min
+    clock.set_wall(clock.now_wall() + 5 * kHour);  // wall +5 h 10 min (e.g. the device slept, or the user moved it)
     const auto d = policy.evaluate(st, clock);
-    EXPECT_FALSE(d.eligible) << "set_wall +5h but mono +1h must NOT be eligible";
+    EXPECT_TRUE(d.eligible);
+    EXPECT_EQ(d.reason, "elapsed");
+    EXPECT_FALSE(d.next_eligible_wall.has_value());
+}
+
+TEST(Cooldown, MonoElapsedEvenIfWallClockWasSetBackIsEligible) {
+    FakeClock clock(at("2026-10-20T02:00:00Z"));
+    CooldownPolicy policy;
+    InboxSyncState st;
+    CooldownPolicy::record_success(st, clock);
+    clock.advance(5 * kHour);                      // mono +5 h
+    clock.set_wall(at("2026-10-20T02:10:00Z"));    // wall says only 10 min
+    const auto d = policy.evaluate(st, clock);
+    EXPECT_TRUE(d.eligible);
+    EXPECT_EQ(d.reason, "elapsed");
+}
+
+TEST(Cooldown, BothClocksUnderCooldownIsBlocked) {
+    FakeClock clock(at("2026-10-20T02:00:00Z"));
+    CooldownPolicy policy;
+    InboxSyncState st;
+    CooldownPolicy::record_success(st, clock);
+    clock.advance(1 * kHour);  // mono +1 h and wall +1 h
+    const auto d = policy.evaluate(st, clock);
+    EXPECT_FALSE(d.eligible);
     EXPECT_EQ(d.reason, "cooldown_active");
-    // For display, next_eligible is still derived from the stored wall time.
     EXPECT_EQ(*d.next_eligible_wall, at("2026-10-20T06:00:00Z"));
-    clock.advance(3 * kHour);  // mono +4h total
+    clock.advance(3 * kHour);
+    EXPECT_TRUE(policy.evaluate(st, clock).eligible);
+}
+
+TEST(Cooldown, BackwardsWallStillNeedsMonoToElapseOnTheSameBoot) {
+    FakeClock clock(at("2026-10-20T02:00:00Z"));
+    CooldownPolicy policy;
+    InboxSyncState st;
+    CooldownPolicy::record_success(st, clock);
+    clock.advance(1 * kHour);
+    clock.set_wall(at("2026-10-19T00:00:00Z"));  // negative wall elapsed
+    EXPECT_FALSE(policy.evaluate(st, clock).eligible);
+    clock.advance(3 * kHour);
     EXPECT_TRUE(policy.evaluate(st, clock).eligible);
 }
 
@@ -323,7 +378,7 @@ TEST(SessionMachine, CanProcessMailAndCanAttemptSync) {
     const std::set<SessionState> process = {SessionState::ReadyCached, SessionState::SyncEligible, SessionState::Syncing,
                                             SessionState::SyncPartial, SessionState::Active, SessionState::Offline};
     const std::set<SessionState> sync = {SessionState::ReadyCached, SessionState::SyncEligible,
-                                         SessionState::SyncPartial, SessionState::Active};
+                                         SessionState::SyncPartial, SessionState::Active, SessionState::Offline};
     for (SessionState s : kAllStates) {
         EXPECT_EQ(SessionStateMachine::can_process_mail(s), process.count(s) == 1) << to_string(s);
         EXPECT_EQ(SessionStateMachine::can_attempt_sync(s), sync.count(s) == 1) << to_string(s);
