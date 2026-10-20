@@ -126,13 +126,14 @@ Device-code sign-in may be blocked by your tenant's Conditional Access policy (M
 
 ## What was tested where
 
-| Level | Status |
+| Level | Status (2026-10-20) |
 |---|---|
-| Unit tests (core, storage, graph adapter) on the Ubuntu host | Written; results are recorded in [docs/TEST_LOG.md](docs/TEST_LOG.md) (integrator fills in). See [docs/TEST_PLAN.md](docs/TEST_PLAN.md) for which acceptance items have an automated test |
-| Desktop simulator (Qt 6.4 UI on the host) | Built and run by hand on the host; see TEST_LOG. No automated UI tests |
-| Fake Graph server (contract tests, CLI) | Python fake server in the repo; contract tests: see TEST_PLAN, which lists what is not yet written. The fake server encodes our model of Graph, not Microsoft's behaviour |
-| Real Microsoft 365 mailbox or synthetic tenant | **NOT YET** |
-| reMarkable Paper Pro device | **NOT YET.** Cross-compile and install scripts exist but are UNTESTED; the build environment had no SDK |
+| Unit tests (core, storage, graph adapter) on the Ubuntu host | Pass: 187 core, 92 storage (1 skipped as root), 66 graph. Details in [docs/TEST_LOG.md](docs/TEST_LOG.md); acceptance mapping in [docs/TEST_PLAN.md](docs/TEST_PLAN.md) |
+| Fake Graph server (contract tests, CLI) | Pass: 27 contract tests and 55 fake-server self-tests; CLI driven end to end (sign-in, sync, cooldown block, archive/delete/defer/undo/undefer, end, sign-out wipe). The fake server encodes our model of Graph, not Microsoft's behaviour |
+| Desktop simulator (Qt 6.4 UI on the host) | Built and run offscreen; screenshots in [docs/screenshots/simulator](docs/screenshots/simulator). No automated UI tests |
+| Device cross-build (official Paper Pro SDK 5.7.119, Qt 6.8.2, aarch64) | Builds cleanly, including the Qt Quick UI. The aarch64 unit and contract test binaries pass under `qemu-aarch64-static` against the SDK sysroot. The UI binary was not executed (no epaper platform plugin outside the device) |
+| Real Microsoft 365 mailbox or synthetic tenant | **NOT YET** (needs an Entra app registration; see docs/THREAT_MODEL.md before any corporate mailbox) |
+| reMarkable Paper Pro hardware | **NOT YET.** Install, run and rollback scripts are UNTESTED on a device; E Ink rendering unverified; see tests/device/CHECKLIST.md |
 
 ## Licence
 
