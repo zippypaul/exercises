@@ -1,0 +1,11 @@
+# slowmail_platform: host/device glue (clock, paths, secure-ish storage). Interface-only for now.
+file(GLOB_RECURSE SLOWMAIL_PLATFORM_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
+if(SLOWMAIL_PLATFORM_SOURCES)
+  add_library(slowmail_platform STATIC ${SLOWMAIL_PLATFORM_SOURCES})
+  target_include_directories(slowmail_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(slowmail_platform PUBLIC slowmail_core)
+  slowmail_apply_warnings(slowmail_platform)
+else()
+  add_library(slowmail_platform INTERFACE)
+  target_include_directories(slowmail_platform INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+endif()

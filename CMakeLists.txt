@@ -1,0 +1,45 @@
+cmake_minimum_required(VERSION 3.22)
+project(slowmail VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(SLOWMAIL_BUILD_UI "Build the Qt Quick UI (requires Qt6 Quick)" ON)
+option(SLOWMAIL_BUILD_TESTS "Build unit and contract tests" ON)
+option(SLOWMAIL_BUILD_CLI "Build the headless CLI / simulator driver" ON)
+option(SLOWMAIL_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(SlowMailWarnings)
+
+find_package(nlohmann_json 3.9 REQUIRED)
+find_package(SQLite3 REQUIRED)
+find_package(CURL REQUIRED)
+find_package(Threads REQUIRED)
+
+add_subdirectory(src/core)
+add_subdirectory(src/storage)
+add_subdirectory(src/graph)
+add_subdirectory(src/platform)
+
+if(SLOWMAIL_BUILD_CLI)
+  add_subdirectory(src/cli)
+endif()
+
+if(SLOWMAIL_BUILD_UI)
+  find_package(Qt6 6.4 COMPONENTS Core Gui Qml Quick QuickControls2 QUIET)
+  if(Qt6_FOUND)
+    add_subdirectory(src/ui)
+  else()
+    message(WARNING "Qt6 Quick not found; UI will not be built. Core, storage, graph, CLI and tests still build.")
+  endif()
+endif()
+
+if(SLOWMAIL_BUILD_TESTS)
+  enable_testing()
+  find_package(GTest REQUIRED)
+  add_subdirectory(tests/unit)
+  add_subdirectory(tests/contract)
+endif()
