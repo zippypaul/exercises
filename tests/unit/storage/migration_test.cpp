@@ -3,9 +3,11 @@
 #include <sqlite3.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "slowmail/storage/sqlite_store.hpp"
 
@@ -35,7 +37,7 @@ TEST(Migration, DowngradedVersionIsMigratedForwardIdempotentlyWithoutDataLoss) {
     {
         SqliteStore s(dir.db());
         ASSERT_TRUE(s.open().ok());
-        ASSERT_EQ(s.schema_version(), 1);
+        ASSERT_EQ(s.schema_version(), 2);
         core::MessageSummary m;
         m.id = "keep-me";
         m.subject = "hello";
@@ -47,7 +49,7 @@ TEST(Migration, DowngradedVersionIsMigratedForwardIdempotentlyWithoutDataLoss) {
     for (int round = 0; round < 3; ++round) {
         SqliteStore s(dir.db());
         ASSERT_TRUE(s.open().ok()) << "round " << round;
-        EXPECT_EQ(s.schema_version(), 1);
+        EXPECT_EQ(s.schema_version(), 2);
         ASSERT_TRUE(s.get_message("keep-me").has_value());
         EXPECT_EQ(s.get_message("keep-me")->subject, "hello");
         EXPECT_EQ(s.get_token_blob().value_or(""), "tok");
@@ -63,7 +65,7 @@ TEST(Migration, FreshDatabaseGetsAllTablesFromEmptyFile) {
     std::fclose(f);
     SqliteStore s(dir.db());
     ASSERT_TRUE(s.open().ok());
-    EXPECT_EQ(s.schema_version(), 1);
+    EXPECT_EQ(s.schema_version(), 2);
     EXPECT_TRUE(s.set_setting("a", "b").ok());
 }
 
@@ -82,6 +84,44 @@ TEST(Migration, MissingVersionRowWithExistingTablesIsRecovered) {
     }
     SqliteStore s(dir.db());
     ASSERT_TRUE(s.open().ok());
-    EXPECT_EQ(s.schema_version(), 1);
+    EXPECT_EQ(s.schema_version(), 2);
     EXPECT_EQ(s.get_setting("keep").value_or(""), "yes");
+}
+
+// v1 -> v2: repairs tombstone flags left inconsistent with state by the F4 bug.
+TEST(Migration, V2RepairsTombstoneFlagsInconsistentWithState) {
+    Dir dir;
+    {
+        SqliteStore s(dir.db());
+        ASSERT_TRUE(s.open().ok());
+        for (const char* id : {"restored", "gone", "plain"}) {
+            core::MessageSummary m;
+            m.id = id;
+            ASSERT_TRUE(s.upsert_message(m).ok());
+        }
+        ASSERT_TRUE(s.mark_gone("gone").ok());
+    }
+    {
+        sqlite3* db = nullptr;
+        ASSERT_EQ(sqlite3_open(dir.db().c_str(), &db), SQLITE_OK);
+        // Reproduce the v1 bug: tombstone stuck at 1 on a restored message; and a gone one lacking it.
+        ASSERT_EQ(sqlite3_exec(db,
+                               "UPDATE message_cache SET tombstone = 1 WHERE id = 'restored';"
+                               "UPDATE message_cache SET tombstone = 0 WHERE id = 'gone';"
+                               "UPDATE settings SET value = '1' WHERE key = 'schema_version';",
+                               nullptr, nullptr, nullptr),
+                  SQLITE_OK);
+        sqlite3_close(db);
+    }
+    SqliteStore s(dir.db());
+    ASSERT_TRUE(s.open().ok());
+    EXPECT_EQ(s.schema_version(), 2);
+    std::vector<std::string> q;
+    for (const auto& m : s.list_queue()) q.push_back(m.id);
+    std::sort(q.begin(), q.end());
+    EXPECT_EQ(q, (std::vector<std::string>{"plain", "restored"}));
+    ASSERT_TRUE(s.purge_tombstones().ok());
+    EXPECT_TRUE(s.get_message("restored").has_value());
+    EXPECT_TRUE(s.get_message("plain").has_value());
+    EXPECT_FALSE(s.get_message("gone").has_value());
 }

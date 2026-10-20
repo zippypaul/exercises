@@ -121,11 +121,25 @@ CREATE TABLE IF NOT EXISTS token_blob (
 );
 )SQL";
 
+// v2: the tombstone flag is derived from state (tombstone = 1 exactly when state = 'gone_on_server').
+// Databases written by v1 code could hold tombstone = 1 on a message that had been restored to another
+// state (hidden from list_queue and deleted by purge_tombstones). Repair them. Idempotent.
+//
+// Ordering note (no schema change needed): command, session_event and session_item are ordinary rowid
+// tables whose rowid is assigned in insertion order and never reused (rows are only deleted by
+// secure_wipe, which empties the file). Listings use it as the tie-breaker after created_at / timestamp.
+// Writers must therefore update with INSERT ... ON CONFLICT DO UPDATE, never INSERT OR REPLACE.
+const char* const kV2 = R"SQL(
+UPDATE message_cache SET tombstone = CASE WHEN state = 'gone_on_server' THEN 1 ELSE 0 END
+    WHERE tombstone != CASE WHEN state = 'gone_on_server' THEN 1 ELSE 0 END;
+)SQL";
+
 } // namespace
 
 const std::vector<Migration>& migrations() {
     static const std::vector<Migration> kMigrations = {
         {1, kV1},
+        {2, kV2},
     };
     return kMigrations;
 }

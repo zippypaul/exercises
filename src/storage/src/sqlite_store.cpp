@@ -626,11 +626,15 @@ Status SqliteStore::upsert_message(const core::MessageSummary& m) {
 }
 
 // Unknown id -> ErrorKind::NotFound (a state change on a message we never cached is a caller bug).
+// The tombstone flag is derived from the state: it is set exactly when the new state is GoneOnServer
+// and cleared otherwise, so a message the sync engine restores (e.g. moved back to the Inbox by another
+// client) is listed by list_queue() again and is not deleted by purge_tombstones().
 Status SqliteStore::set_message_state(const std::string& id, core::MessageState state, const std::string& reason) {
-    Stmt s(db_, "UPDATE message_cache SET state = ?, state_reason = ? WHERE id = ?;");
+    Stmt s(db_, "UPDATE message_cache SET state = ?, state_reason = ?, tombstone = ? WHERE id = ?;");
     s.bind(1, core::to_string(state));
     s.bind(2, reason);
-    s.bind(3, id);
+    s.bind(3, state == core::MessageState::GoneOnServer ? 1 : 0);
+    s.bind(4, id);
     Status st = s.run();
     if (st.ok() && s.changes() == 0) {
         return Status(Error{ErrorKind::NotFound, "message not in local cache", 0, std::nullopt, ""});
@@ -803,7 +807,10 @@ std::vector<core::SessionItem> SqliteStore::list_session_items(const std::string
 // command journal
 // ---------------------------------------------------------------------------
 
-// Insert or replace by id. An empty idempotency_key is stored as NULL so any number of key-less
+// Insert or update by id. The upsert (ON CONFLICT DO UPDATE) deliberately keeps the row's rowid, which is
+// the insertion sequence used as the tie-breaker when listing (created_at is only second-resolution);
+// INSERT OR REPLACE would delete and re-insert the row under a new rowid and reorder an updated command.
+// An empty idempotency_key is stored as NULL so any number of key-less
 // commands can coexist; a non-empty key already owned by a DIFFERENT command id violates the UNIQUE
 // constraint and returns a Storage error (callers use find_command_by_idempotency_key first).
 Status SqliteStore::put_command(const core::Command& c) {
@@ -840,10 +847,11 @@ std::optional<core::Command> SqliteStore::get_command(const std::string& id) {
     return std::nullopt;
 }
 
+// Oldest first: created_at, then insertion order (rowid) so same-second commands stay FIFO.
 std::vector<core::Command> SqliteStore::list_commands(core::CommandState state) {
     std::vector<core::Command> out;
     const std::string sql =
-        std::string("SELECT ") + kCommandCols + " FROM command WHERE state = ? ORDER BY created_at ASC, id;";
+        std::string("SELECT ") + kCommandCols + " FROM command WHERE state = ? ORDER BY created_at ASC, rowid ASC;";
     Stmt s(db_, sql.c_str());
     s.bind(1, core::to_string(state));
     while (s.step_row()) out.push_back(command_from_row(s));
@@ -853,7 +861,7 @@ std::vector<core::Command> SqliteStore::list_commands(core::CommandState state) 
 std::vector<core::Command> SqliteStore::list_commands_for_message(const std::string& message_id) {
     std::vector<core::Command> out;
     const std::string sql =
-        std::string("SELECT ") + kCommandCols + " FROM command WHERE message_id = ? ORDER BY created_at ASC, id;";
+        std::string("SELECT ") + kCommandCols + " FROM command WHERE message_id = ? ORDER BY created_at ASC, rowid ASC;";
     Stmt s(db_, sql.c_str());
     s.bind(1, message_id);
     while (s.step_row()) out.push_back(command_from_row(s));
@@ -893,10 +901,11 @@ Status SqliteStore::put_event(const core::SessionEvent& e) {
     return s.run();
 }
 
+// Newest first: timestamp, then reverse insertion order (rowid) for same-second events.
 std::vector<core::SessionEvent> SqliteStore::list_events(const std::string& session_id) {
     std::vector<core::SessionEvent> out;
     const std::string sql = std::string("SELECT ") + kEventCols +
-                            " FROM session_event WHERE session_id = ? ORDER BY timestamp DESC, id DESC;";
+                            " FROM session_event WHERE session_id = ? ORDER BY timestamp DESC, rowid DESC;";
     Stmt s(db_, sql.c_str());
     s.bind(1, session_id);
     while (s.step_row()) out.push_back(event_from_row(s));

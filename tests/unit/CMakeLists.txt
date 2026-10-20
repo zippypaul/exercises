@@ -19,3 +19,11 @@ if(SLOWMAIL_GRAPH_TESTS)
   target_link_libraries(graph_tests PRIVATE slowmail_graph GTest::gtest GTest::gtest_main)
   add_test(NAME graph_tests COMMAND graph_tests)
 endif()
+
+# Engine scenarios run against MemoryStore and SqliteStore (store-contract divergence).
+file(GLOB SLOWMAIL_INTEGRATION_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/*.cpp)
+if(SLOWMAIL_INTEGRATION_TESTS)
+  add_executable(integration_tests ${SLOWMAIL_INTEGRATION_TESTS})
+  target_link_libraries(integration_tests PRIVATE slowmail_core slowmail_storage GTest::gtest GTest::gtest_main)
+  add_test(NAME integration_tests COMMAND integration_tests)
+endif()

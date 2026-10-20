@@ -128,9 +128,9 @@ INSTANTIATE_TEST_SUITE_P(Backends, SqliteStoreTest, ::testing::Values(true, fals
 
 } // namespace
 
-TEST_P(SqliteStoreTest, SchemaCreatedAtVersion1) {
-    EXPECT_EQ(store_->schema_version(), 1);
-    EXPECT_EQ(store_->get_setting("schema_version").value_or(""), "1");
+TEST_P(SqliteStoreTest, SchemaCreatedAtLatestVersion) {
+    EXPECT_EQ(store_->schema_version(), 2);
+    EXPECT_EQ(store_->get_setting("schema_version").value_or(""), "2");
 }
 
 TEST_P(SqliteStoreTest, OpenIsIdempotent) {
@@ -299,11 +299,44 @@ TEST_P(SqliteStoreTest, ListQueueOrderingAndFiltering) {
     EXPECT_EQ(arch[0].id, "archived");
 }
 
-TEST_P(SqliteStoreTest, ListQueueExcludesTombstonedEvenIfStateReset) {
+// F4: tombstone is derived from state. A message restored from GoneOnServer is listed again and is
+// not deleted by purge_tombstones.
+TEST_P(SqliteStoreTest, RestoredFromGoneIsListedAndSurvivesPurge) {
+    ASSERT_TRUE(store_->upsert_message(full_message("x")).ok());
+    MessageBody b;
+    b.id = "x";
+    b.text = "body";
+    ASSERT_TRUE(store_->put_body(b).ok());
+    ASSERT_TRUE(store_->mark_gone("x").ok());
+    EXPECT_TRUE(store_->list_queue().empty());
+    ASSERT_TRUE(store_->set_message_state("x", MessageState::InQueue, "restored").ok());
+    auto q = store_->list_queue();
+    ASSERT_EQ(q.size(), 1u);
+    EXPECT_EQ(q[0].id, "x");
+    ASSERT_TRUE(store_->purge_tombstones().ok());
+    EXPECT_EQ(store_->get_message_state("x"), MessageState::InQueue);
+    EXPECT_TRUE(store_->get_body("x").has_value());
+    EXPECT_EQ(store_->list_queue().size(), 1u);
+}
+
+TEST_P(SqliteStoreTest, GoneAgainAfterRestoreIsHiddenAndPurged) {
     ASSERT_TRUE(store_->upsert_message(full_message("x")).ok());
     ASSERT_TRUE(store_->mark_gone("x").ok());
-    ASSERT_TRUE(store_->set_message_state("x", MessageState::InQueue, "").ok());  // tombstone flag stays
+    ASSERT_TRUE(store_->set_message_state("x", MessageState::InQueue, "").ok());
+    ASSERT_TRUE(store_->set_message_state("x", MessageState::GoneOnServer, "").ok());  // tombstoned via state alone
     EXPECT_TRUE(store_->list_queue().empty());
+    ASSERT_TRUE(store_->purge_tombstones().ok());
+    EXPECT_FALSE(store_->get_message("x").has_value());
+}
+
+TEST_P(SqliteStoreTest, UpsertOfGoneMessageStaysTombstonedAndPurged) {
+    ASSERT_TRUE(store_->upsert_message(full_message("x")).ok());
+    ASSERT_TRUE(store_->mark_gone("x").ok());
+    ASSERT_TRUE(store_->upsert_message(full_message("x")).ok());
+    EXPECT_EQ(store_->get_message_state("x"), MessageState::GoneOnServer);
+    EXPECT_TRUE(store_->list_queue().empty());
+    ASSERT_TRUE(store_->purge_tombstones().ok());
+    EXPECT_FALSE(store_->get_message("x").has_value());
 }
 
 TEST_P(SqliteStoreTest, SetMessageStateStoresReasonAndEveryStateRoundTrips) {
@@ -609,13 +642,13 @@ TEST_P(SqliteStoreTest, ListCommandsOrderingFifoAndByMessage) {
     };
     add("c3", 300, "m1", CommandState::Pending);
     add("b1", 100, "m1", CommandState::Pending);
-    add("a1", 100, "m2", CommandState::Pending);  // ties with b1 on created_at: id ascending
+    add("a1", 100, "m2", CommandState::Pending);  // ties with b1 on created_at: insertion order (b1 first)
     add("d4", 50, "m2", CommandState::Failed);
 
     auto pending = store_->list_commands(CommandState::Pending);
     ASSERT_EQ(pending.size(), 3u);
-    EXPECT_EQ(pending[0].id, "a1");
-    EXPECT_EQ(pending[1].id, "b1");
+    EXPECT_EQ(pending[0].id, "b1");
+    EXPECT_EQ(pending[1].id, "a1");
     EXPECT_EQ(pending[2].id, "c3");
 
     auto m1 = store_->list_commands_for_message("m1");
@@ -627,6 +660,77 @@ TEST_P(SqliteStoreTest, ListCommandsOrderingFifoAndByMessage) {
     EXPECT_EQ(m2[0].id, "d4");
     EXPECT_EQ(m2[1].id, "a1");
     EXPECT_TRUE(store_->list_commands_for_message("none").empty());
+}
+
+// F9: created_at has one-second resolution; same-second commands must come back in insertion order, and
+// updating one must not move it.
+TEST_P(SqliteStoreTest, SameSecondCommandsKeepInsertionOrderAndUpdateKeepsPosition) {
+    std::vector<std::string> ids;
+    for (int i = 0; i < 50; ++i) {
+        // Ids deliberately not in insertion order (mimics random hex ids).
+        const std::string id = "id-" + std::to_string((i * 37) % 50 + 100);
+        ids.push_back(id);
+        Command c = full_command(id, "k-" + id);
+        c.created_at = 1000;
+        c.message_id = "m";
+        c.state = CommandState::Pending;
+        ASSERT_TRUE(store_->put_command(c).ok());
+    }
+    auto check = [&](const std::vector<Command>& got) {
+        ASSERT_EQ(got.size(), ids.size());
+        for (std::size_t i = 0; i < ids.size(); ++i) EXPECT_EQ(got[i].id, ids[i]) << i;
+    };
+    check(store_->list_commands(CommandState::Pending));
+    check(store_->list_commands_for_message("m"));
+
+    Command upd = *store_->get_command(ids[3]);
+    upd.state = CommandState::Failed;
+    upd.attempts = 2;
+    ASSERT_TRUE(store_->put_command(upd).ok());
+    EXPECT_EQ(store_->get_command(ids[3])->state, CommandState::Failed);
+    check(store_->list_commands_for_message("m"));
+    EXPECT_EQ(store_->list_commands(CommandState::Pending).size(), 49u);
+    upd.state = CommandState::Pending;
+    ASSERT_TRUE(store_->put_command(upd).ok());
+    check(store_->list_commands(CommandState::Pending));
+}
+
+TEST_P(SqliteStoreTest, SameSecondEventsNewestInsertedFirstAndUpdateKeepsPosition) {
+    const char* names[] = {"z", "a", "m", "b"};
+    for (const char* n : names) ASSERT_TRUE(store_->put_event(full_event(n, 500)).ok());
+    auto list = store_->list_events("sess-1");
+    ASSERT_EQ(list.size(), 4u);
+    EXPECT_EQ(list[0].id, "b");
+    EXPECT_EQ(list[1].id, "m");
+    EXPECT_EQ(list[2].id, "a");
+    EXPECT_EQ(list[3].id, "z");
+    SessionEvent upd = full_event("a", 500);
+    upd.confirmation = ConfirmationState::Confirmed;
+    ASSERT_TRUE(store_->put_event(upd).ok());
+    list = store_->list_events("sess-1");
+    EXPECT_EQ(list[2].id, "a");
+    EXPECT_EQ(list[2].confirmation, ConfirmationState::Confirmed);
+}
+
+TEST_P(SqliteStoreTest, SessionItemsKeepInsertionOrderAcrossUpdates) {
+    const char* ids[] = {"z", "a", "m"};
+    for (const char* id : ids) {
+        SessionItem it;
+        it.session_id = "s";
+        it.message_id = id;
+        ASSERT_TRUE(store_->put_session_item(it).ok());
+    }
+    SessionItem upd;
+    upd.session_id = "s";
+    upd.message_id = "z";
+    upd.current_state = MessageState::Archived;
+    ASSERT_TRUE(store_->put_session_item(upd).ok());
+    auto items = store_->list_session_items("s");
+    ASSERT_EQ(items.size(), 3u);
+    EXPECT_EQ(items[0].message_id, "z");
+    EXPECT_EQ(items[0].current_state, MessageState::Archived);
+    EXPECT_EQ(items[1].message_id, "a");
+    EXPECT_EQ(items[2].message_id, "m");
 }
 
 TEST_P(SqliteStoreTest, EventRoundTripEveryField) {
@@ -809,7 +913,7 @@ TEST_P(SqliteStoreTest, SecureWipeClearsAllDataAndStoreReopens) {
     EXPECT_EQ(st.error().kind, ErrorKind::Storage);
 
     ASSERT_TRUE(store_->open().ok());
-    EXPECT_EQ(store_->schema_version(), 1);
+    EXPECT_EQ(store_->schema_version(), 2);
     EXPECT_EQ(store_->count_messages(), 0u);
     EXPECT_FALSE(store_->get_setting("k").has_value());
     EXPECT_FALSE(store_->get_token_blob().has_value());
@@ -826,7 +930,7 @@ TEST(SqliteStoreFile, ReopenKeepsDataAcrossEveryTable) {
     {
         SqliteStore s(dir.db());
         ASSERT_TRUE(s.open().ok());
-        EXPECT_EQ(s.schema_version(), 1);
+        EXPECT_EQ(s.schema_version(), 2);
         ASSERT_TRUE(s.set_setting("k", "v").ok());
         AccountInfo a;
         a.tenant_id = "t";
@@ -856,7 +960,7 @@ TEST(SqliteStoreFile, ReopenKeepsDataAcrossEveryTable) {
     }
     SqliteStore s(dir.db());
     ASSERT_TRUE(s.open().ok());
-    EXPECT_EQ(s.schema_version(), 1);
+    EXPECT_EQ(s.schema_version(), 2);
     EXPECT_EQ(s.get_setting("k").value_or(""), "v");
     EXPECT_TRUE(s.get_account().has_value());
     EXPECT_EQ(s.get_sync_state().delta_link.value_or(""), "dl");

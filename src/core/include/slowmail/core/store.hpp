@@ -14,6 +14,13 @@ namespace slowmail::core {
 //  * message ids are opaque strings; the store never interprets them
 //  * nothing is ever hard-deleted from message_cache; use tombstone (GoneOnServer) instead,
 //    except via purge_tombstones() which the app calls at session end
+//  * "tombstoned" is derived from state, never stored independently: a message is tombstoned exactly
+//    while its state is GoneOnServer. set_message_state(id, <any other state>) therefore un-tombstones
+//    it (list_queue lists it again and purge_tombstones keeps it); an implementation that keeps a
+//    separate tombstone flag must update it on every state change. upsert_message never changes it.
+//  * list_commands / list_commands_for_message return commands in insertion order (FIFO) even when
+//    created_at is equal, and updating a command via put_command keeps its position;
+//    list_events is newest first, later insertions first on equal timestamps
 class Store {
 public:
     virtual ~Store() = default;
