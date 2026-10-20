@@ -1,0 +1,30 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: nlohmann-json
+Source: https://github.com/nlohmann/json
+
+Files: *
+Copyright: 2013-2022 Niels Lohmann
+License: Expat
+
+Files: include/nlohmann/detail/conversions/to_chars.hpp
+Copyright: 2009 Florian Loitsch
+License: Expat
+
+Files: include/nlohmann/detail/output/serializer.hpp
+Copyright: 2008-2009 Bjoern Hoehrmann <bjoern@hoehrmann.de>
+License: Expat
+
+Files: debian/*
+Copyright: 2016 Muri Nicanor <muri@immerda.ch>
+  2018 Hubert Chathi <uhoreg@debian.org>
+  2019-2023 Gianfranco Costamagna <locutusofborg@debian.org>
+License: Expat
+
+Files: tests/thirdparty/Fuzzer/*
+Copyright: University of Illinois at Urbana-Champaign
+License: U-OF-I-BSD-LIKE
+
+Files: tools/amalgamate/*
+Copyright: 2012, Erik Edlund <erik.edlund@32767.se>
+License: BSD-3-clause
+
