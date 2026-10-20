@@ -436,6 +436,48 @@ class GraphTests(Base):
         ids = self.load(1)
         self.assertEqual(self.g("POST", f"/v1.0/me/messages/{ids[0]}/move", {}, IMM)[0], 400)
 
+    def test_scope_check_requires_mail_readwrite_for_writes(self) -> None:
+        ids = self.load(3)
+        self.sign_in(scope="offline_access User.Read Mail.Read")
+        path = f"/v1.0/me/messages/{ids[0]}"
+        self.assertEqual(self.g("GET", path, headers=IMM)[0], 200)  # reads are fine
+        for method, p, body in (("PATCH", path, {"isRead": True}),
+                                ("POST", path + "/move", {"destinationId": "archive"}),
+                                ("DELETE", path, None)):
+            st, _, err = self.g(method, p, body, IMM)
+            self.assertEqual((st, err["error"]["code"]), (403, "ErrorAccessDenied"), method)
+        # a forbidden write must not have changed anything
+        st = self.ctl("state")
+        self.assertEqual(st["messages"][ids[0]]["parentFolder"], "inbox")
+        self.assertFalse(st["messages"][ids[0]]["isRead"])
+        # the same writes succeed with Mail.ReadWrite (any case, or the resource-qualified form)
+        self.sign_in(scope="offline_access https://graph.microsoft.com/mail.readwrite")
+        self.assertEqual(self.g("PATCH", path, {"isRead": True}, IMM)[0], 200)
+        self.assertEqual(self.g("POST", path + "/move", {"destinationId": "archive"}, IMM)[0], 201)
+
+    def test_scope_check_can_be_disabled(self) -> None:
+        ids = self.load(1)
+        self.sign_in(scope="offline_access User.Read")
+        path = f"/v1.0/me/messages/{ids[0]}"
+        self.assertEqual(self.g("PATCH", path, {"isRead": True}, IMM)[0], 403)
+        self.ctl("config", {"scope_check": False})
+        self.assertEqual(self.g("PATCH", path, {"isRead": True}, IMM)[0], 200)
+        self.ctl("reset")  # reset restores the startup default (on)
+        self.assertTrue(self.ctl("config")["scope_check"])
+
+    def test_remove_already_moved_404_switch(self) -> None:
+        ids = self.load(2)
+        self.sign_in()
+        move = lambda i: self.g("POST", f"/v1.0/me/messages/{i}/move", {"destinationId": "archive"}, IMM)  # noqa: E731
+        self.assertEqual(move(ids[0])[0], 201)
+        self.assertEqual(move(ids[0])[0], 201)  # default: re-move is a harmless no-op
+        self.ctl("config", {"remove_already_moved_404": True})
+        st, _, err = move(ids[0])
+        self.assertEqual((st, err["error"]["code"]), (404, "ErrorItemNotFound"))
+        self.assertEqual(self.ctl("state")["messages"][ids[0]]["parentFolder"], "archive")
+        self.assertEqual(move(ids[1])[0], 201)  # a first move still works in this mode
+        self.assertEqual(self.g("POST", f"/v1.0/me/messages/{ids[1]}/move", {"destinationId": "deleteditems"}, IMM)[0], 201)
+
     def test_delete_endpoint_is_soft_and_counted(self) -> None:
         ids = self.load(2)
         self.assertEqual(self.g("DELETE", f"/v1.0/me/messages/{ids[0]}", None, IMM)[0], 204)
@@ -584,11 +626,35 @@ class ControlTests(Base):
         self.assertNotIn("fake-at", json.dumps(reqs))  # tokens never recorded
         self.assertEqual(last["body_length"], 0)
 
-    def test_request_log_capped_at_200(self) -> None:
+    def test_request_log_holds_more_than_200_and_is_capped_at_5000(self) -> None:
         self.sign_in()
-        for _ in range(210):
+        self.ctl("clear_log")
+        for _ in range(250):
             self.g("GET", "/v1.0/me")
-        self.assertEqual(len(self.ctl("requests")), 200)
+        self.assertEqual(len(self.ctl("requests")), 250)
+        self.assertEqual(self.srv.app.log.maxlen, 5000)
+
+    def test_request_invariant_counters_do_not_depend_on_the_log(self) -> None:
+        self.sign_in()
+        ids = self.load(1)
+        self.ctl("clear_log")
+        self.g("GET", "/v1.0/me", headers=IMM)
+        self.g("GET", f"/v1.0/me/messages/{ids[0]}/attachments?$select=id,contentBytes", headers=IMM)
+        self.g("GET", f"/v1.0/me/messages/{ids[0]}/$value", headers=IMM)
+        self.g("GET", "/v1.0/me")  # no Prefer: IdType
+        self.g("GET", "/v1.0/me", headers={"Prefer": 'odata.maxpagesize=5'})
+        for _ in range(300):  # push the early requests out of any short log
+            self.g("GET", "/v1.0/me", headers=IMM)
+        c = self.ctl("state")["counters"]
+        self.assertEqual(c["requests_missing_immutable_prefer"], 2)
+        self.assertEqual(c["requests_with_value_or_contentbytes"], 2)
+        self.assertEqual(c["graph_requests"], 305)
+        # oauth and control calls are not Graph requests
+        self.sign_in()
+        self.assertEqual(self.ctl("state")["counters"]["graph_requests"], 305)
+        self.ctl("clear_log")
+        c = self.ctl("state")["counters"]
+        self.assertEqual((c["requests_missing_immutable_prefer"], c["requests_with_value_or_contentbytes"]), (0, 0))
 
     def test_reset_and_load_fixtures(self) -> None:
         self.assertEqual(self.ctl("load", {"path": os.path.join(FIXTURE_DIR, "inbox_small.json")})["loaded"], 12)
@@ -726,6 +792,13 @@ class SubprocessTests(unittest.TestCase):
         self.assertTrue(s.parse_args([]).delta_partial_updates)
         self.assertFalse(s.parse_args(["--no-delta-partial-updates"]).delta_partial_updates)
         self.assertTrue(s.parse_args(["--delta-replay"]).delta_replay)
+
+    def test_scope_check_and_already_moved_cli_flags(self) -> None:
+        import server as s
+        self.assertTrue(s.parse_args([]).scope_check)
+        self.assertFalse(s.parse_args(["--no-scope-check"]).scope_check)
+        self.assertFalse(s.parse_args([]).remove_already_moved_404)
+        self.assertTrue(s.parse_args(["--remove-already-moved-404"]).remove_already_moved_404)
 
 
 if __name__ == "__main__":

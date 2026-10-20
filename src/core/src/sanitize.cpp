@@ -88,7 +88,8 @@ void utf8_append(std::string& out, std::uint32_t cp) {
 }
 
 // Characters removed outright: C0 controls (except \n \t \r \f, handled as whitespace), DEL, C1 controls,
-// soft hyphen, zero-width space, bidi controls/overrides, word joiner and BOM. ZWJ/ZWNJ are kept
+// soft hyphen, zero-width space, bidi controls/overrides (incl. U+061C), word joiner, Mongolian vowel separator,
+// interlinear annotation characters, tag characters and BOM. ZWJ/ZWNJ are kept
 // because emoji sequences and some scripts need them.
 bool is_stripped(std::uint32_t cp) {
     if (cp < 0x20) return !(cp == '\n' || cp == '\t' || cp == '\r' || cp == '\f');
@@ -97,6 +98,9 @@ bool is_stripped(std::uint32_t cp) {
     if (cp >= 0x202A && cp <= 0x202E) return true;
     if (cp >= 0x2060 && cp <= 0x2064) return true;
     if (cp >= 0x2066 && cp <= 0x2069) return true;
+    if (cp == 0x061C || cp == 0x180E) return true;      // Arabic letter mark, Mongolian vowel separator
+    if (cp >= 0xFFF9 && cp <= 0xFFFB) return true;      // interlinear annotation anchor/separator/terminator
+    if (cp >= 0xE0000 && cp <= 0xE007F) return true;    // tag characters (invisible ASCII smuggling)
     return cp == 0xFEFF;
 }
 
@@ -452,8 +456,15 @@ private:
         if (p + 1 >= n_ || h_[p] != '<') return std::string::npos;
         if (h_[p + 1] == '!') {
             if (h_.compare(p, 4, "<!--") == 0) {
-                const std::size_t e = h_.find("-->", p + 4);
-                return e == std::string::npos ? n_ : e + 3;
+                // HTML5: "<!-->" and "<!--->" are complete, empty comments (abrupt closing); otherwise the comment
+                // ends at the first "-->" or "--!>".
+                if (p + 4 < n_ && h_[p + 4] == '>') return p + 5;
+                if (p + 5 < n_ && h_[p + 4] == '-' && h_[p + 5] == '>') return p + 6;
+                const std::size_t e1 = h_.find("-->", p + 4);
+                const std::size_t e2 = h_.find("--!>", p + 4);
+                if (e1 == std::string::npos && e2 == std::string::npos) return n_;
+                if (e2 == std::string::npos || (e1 != std::string::npos && e1 < e2)) return e1 + 3;
+                return e2 + 4;
             }
             if (h_.compare(p, 9, "<![CDATA[") == 0) {
                 const std::size_t e = h_.find("]]>", p + 9);

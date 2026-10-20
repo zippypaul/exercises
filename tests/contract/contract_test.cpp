@@ -361,6 +361,58 @@ TEST_F(Contract, A06_CrashDuringPendingArchiveRecoversSafely) {
     EXPECT_EQ(stack().store().get_message_state(kPlain), MessageState::Archived);
 }
 
+// A06 variant (ASM-34): real Graph may answer a re-move of a message that is already in the destination with
+// 404 ErrorItemNotFound instead of a 201 no-op. The fake can be switched to that behaviour; the outcome is then
+// "no duplicate, no data loss, but no undo": the command is Abandoned and the activity row says "already gone".
+TEST_F(Contract, A06_CrashRetryWhenRemoveOfAlreadyMovedMessageIs404) {
+    ASSERT_NO_FATAL_FAILURE(synced("inbox_small.json"));
+    ctl().post("drop", {{"match", "/move"}, {"after", true}, {"count", -1}});  // applied server-side, response lost
+    auto first = stack().session().archive(kPlain);
+    ASSERT_TRUE(first.ok()) << first.error().message;
+    ctl().post("clear_faults");
+    ASSERT_EQ(ctl().parent_of(kPlain), "archive");  // the server did act
+    const auto cmd_id = first.value().id;
+    {
+        auto cmd = stack().store().get_command(cmd_id);
+        ASSERT_TRUE(cmd.has_value());
+        EXPECT_NE(cmd->state, CommandState::Confirmed);
+    }
+
+    // The retry after the "crash" meets the 404 world.
+    ctl().post("config", {{"remove_already_moved_404", true}});
+    stack_.reset();
+    make_stack();
+    auto st = stack().session().start();
+    ASSERT_TRUE(st.ok()) << st.error().message;
+    auto report = stack().session().flush();
+    EXPECT_EQ(report.failed, 0u);
+
+    // user-visible outcome
+    auto after = stack().store().get_command(cmd_id);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->state, CommandState::Abandoned);
+    EXPECT_EQ(stack().store().list_commands(CommandState::Pending).size(), 0u);
+    EXPECT_EQ(stack().store().list_commands(CommandState::InFlight).size(), 0u);
+    EXPECT_EQ(queue_ids().count(kPlain), 0u);
+    EXPECT_EQ(stack().store().get_message_state(kPlain), MessageState::GoneOnServer);
+    bool seen = false;
+    for (auto& row : stack().session().activity()) {
+        if (row.event.message_id != kPlain) continue;
+        seen = true;
+        EXPECT_EQ(row.event.confirmation, core::ConfirmationState::Failed);
+        EXPECT_EQ(row.event.failure_reason, "already gone");
+    }
+    EXPECT_TRUE(seen);
+
+    // server truth: archived exactly once (no duplicate), still in the archive (no data loss); undo is unavailable
+    auto archive = ctl().folder_ids("archive");
+    EXPECT_EQ(std::count(archive.begin(), archive.end(), kPlain), 1);
+    auto inbox = ctl().folder_ids("inbox");
+    EXPECT_EQ(std::count(inbox.begin(), inbox.end(), kPlain), 0);
+    EXPECT_EQ(ctl().parent_of(kPlain), "archive");
+    EXPECT_EQ(ctl().folder_ids("deleteditems").size(), 0u);
+}
+
 // ------------------------------------------------------------------------------------------------
 // A09: offline use
 // ------------------------------------------------------------------------------------------------
@@ -700,6 +752,21 @@ TEST_F(Contract, Gate2_RequestShapeInvariants) {
     EXPECT_EQ(ctl().counter("forbidden_fetch"), 0);
     EXPECT_EQ(ctl().counter("content_bytes_served"), 0);
     EXPECT_EQ(ctl().counter("delete_calls"), 0);
+    // request-time counters in the server: independent of the (capped) request log
+    EXPECT_GT(ctl().counter("graph_requests"), 0);
+    EXPECT_EQ(ctl().counter("requests_missing_immutable_prefer"), 0);
+    EXPECT_EQ(ctl().counter("requests_with_value_or_contentbytes"), 0);
+}
+
+// The fake enforces scope (default on): writes need Mail.ReadWrite. The production stack must keep requesting it.
+TEST_F(Contract, Gate2_StackRequestsMailReadWriteAndWritesAreNotForbidden) {
+    ASSERT_NO_FATAL_FAILURE(synced("inbox_small.json"));
+    const auto& scopes = stack().auth().config().scopes;
+    EXPECT_NE(std::find(scopes.begin(), scopes.end(), "Mail.ReadWrite"), scopes.end());
+    EXPECT_TRUE(ctl().get("config").at("scope_check").get<bool>());
+    EXPECT_EQ(confirmed_command(stack().session().archive(kPlain)).state, CommandState::Confirmed);
+    EXPECT_EQ(confirmed_command(stack().session().defer(kHtmlTracker)).state, CommandState::Confirmed);
+    for (auto& r : ctl().requests()) EXPECT_NE(r.at("status").get<int>(), 403) << r.at("method") << " " << r.at("path");
 }
 
 }  // namespace

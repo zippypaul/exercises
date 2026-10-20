@@ -42,6 +42,8 @@ C++ contract tests use. `--exit-on-stdin-eof` makes the server exit if its paren
 | `--no-slow-down` | off | never answer `slow_down` |
 | `--lenient-refresh` | off | refresh does not invalidate the used refresh token (default rotates, as Entra tells apps to expect) |
 | `--no-archive` | off | mailbox without an archive folder |
+| `--scope-check` / `--no-scope-check` | on | move, PATCH and DELETE need `Mail.ReadWrite` in the token scope, else `403 ErrorAccessDenied` (config key `scope_check`) |
+| `--remove-already-moved-404` | off | re-moving a message already in the destination answers `404 ErrorItemNotFound` instead of a `201` no-op; real Graph behaviour is UNVERIFIED (ASM-34); config key `remove_already_moved_404` |
 | `--verbose` | off | one stderr line per request (`METHOD path?query -> status`); tokens are never printed |
 
 All of these except `--port`/`--host`/`--load`/`--generate` can also be changed at runtime with `POST /__control/config`
@@ -104,8 +106,8 @@ All of these except `--port`/`--host`/`--load`/`--generate` can also be changed 
 | `POST external` | simulate another Outlook client (below) |
 | `POST config` `{...}` / `GET config` | change / read runtime options |
 | `POST folders` `{"archive": false}` | remove / restore the archive folder |
-| `GET state` | `{folders:{inbox:[ids],archive:[..],deleteditems:[..]}, messages:{id:{subject,flagStatus,parentFolder,isRead,mutableId}}, counters:{requests,forbidden_fetch,content_bytes_served,delete_calls,graph_401,refreshes,device_codes_issued,by_path}, generation, config}`. Ids are immutable ids; folder lists are newest first. `by_path` keys look like `POST /v1.0/me/messages/{id}/move` |
-| `GET requests` | last 200 Graph/OAuth requests: `seq, method, path, query, headers{Prefer,Content-Type,Accept,User-Agent,If-Match,Authorization:"Bearer <redacted>"}, body_length, status` (`status` 0 = dropped) |
+| `GET state` | `{folders:{inbox:[ids],archive:[..],deleteditems:[..]}, messages:{id:{subject,flagStatus,parentFolder,isRead,mutableId}}, counters:{requests,forbidden_fetch,content_bytes_served,delete_calls,graph_401,refreshes,device_codes_issued,graph_requests,requests_missing_immutable_prefer,requests_with_value_or_contentbytes,by_path}, generation, config}`. Ids are immutable ids; folder lists are newest first. `by_path` keys look like `POST /v1.0/me/messages/{id}/move` |
+| `GET requests` | last 5000 Graph/OAuth requests (assert on the `state` counters for anything that must hold for EVERY request): `seq, method, path, query, headers{Prefer,Content-Type,Accept,User-Agent,If-Match,Authorization:"Bearer <redacted>"}, body_length, status` (`status` 0 = dropped) |
 
 `external` ops (ids may be immutable or current mutable ids):
 `{"op":"move","id":..,"to":"archive"}`, `{"op":"delete","id":..}` (soft, to Deleted Items) or with `"hard":true`

@@ -206,8 +206,10 @@ core::Error GraphBackend::map_http_error(const HttpResponse& r) {
     e.http_status = r.status;
 
     std::string request_id;
+    bool non_json = false;
     {
         const json j = json::parse(r.body, nullptr, false);  // 503 from a front proxy may be HTML
+        non_json = j.is_discarded();
         if (!j.is_discarded()) {
             if (const json* err = find_ci(j, "error"); err && err->is_object()) {
                 e.code = clean_code(str_of(*err, "code"));
@@ -239,6 +241,13 @@ core::Error GraphBackend::map_http_error(const HttpResponse& r) {
         e.kind = core::ErrorKind::Malformed;  // redirects are never followed
     } else {
         e.kind = core::ErrorKind::Invalid;
+    }
+    if (non_json) {
+        // Proxy error pages, captive portals, a wrong base URL: no Graph error code exists, so say so explicitly.
+        // Callers must never read an empty code as "item not found".
+        e.code.clear();
+        e.message = "non-JSON " + std::to_string(s) + " response";
+        return e;
     }
     e.message = "Graph request failed: HTTP " + std::to_string(s);
     if (!e.code.empty()) e.message += " " + e.code;
@@ -383,7 +392,9 @@ core::Outcome<core::DeltaPage> GraphBackend::fetch_inbox_delta(const std::string
         } else {
             // Links are opaque and used verbatim, but never sent (with a bearer token) to a foreign origin.
             if (url::origin_of(link) != url::origin_of(config_.base_url)) {
-                return make_error(core::ErrorKind::Invalid, "delta link does not belong to the Graph endpoint");
+                // The stored link was issued for another endpoint (e.g. the data dir was reused with a different
+                // SLOWMAIL_GRAPH_BASE_URL). Gone makes the core do a full resync; the token is still never sent there.
+                return make_error(core::ErrorKind::Gone, "delta link does not belong to the Graph endpoint");
             }
             url = link;
         }
@@ -413,7 +424,10 @@ core::Outcome<core::DeltaPage> GraphBackend::fetch_inbox_delta(const std::string
                     with_select(config_.base_url + "/me/messages/" + url::encode_path_segment(id), kMessageSelect);
                 auto g = call("GET", murl, "", {});
                 if (!g.ok()) {
-                    if (g.error().kind == core::ErrorKind::NotFound && g.error().code != "ErrorFolderNotFound") {
+                    // Only a definite Graph "item not found" means the message is gone. Any other 404 (empty code from
+                    // a proxy page or wrong base URL, ErrorFolderNotFound, ...) stops the sync with a retryable error
+                    // instead of silently dropping part of the page.
+                    if (g.error().kind == core::ErrorKind::NotFound && g.error().code == "ErrorItemNotFound") {
                         page.removed_ids.push_back(id);
                         drop[idx] = true;
                         continue;
@@ -520,7 +534,18 @@ core::Status GraphBackend::set_flag(const std::string& message_id, core::FlagSta
         const json body = {{"flag", flag}};
         auto r = call("PATCH", config_.base_url + "/me/messages/" + url::encode_path_segment(message_id), body.dump(), {});
         if (!r.ok()) return r.error();
-        return core::Status::success();  // response is the full message; intentionally ignored
+        // The response is the full message. When it is JSON with a flag object, the status must be the one requested;
+        // anything else means the write did not do what we asked (or the answer is not from Graph).
+        const json resp = json::parse(r.value().body, nullptr, false);
+        if (!resp.is_discarded() && resp.is_object()) {
+            if (const json* f = find_ci(resp, "flag"); f && f->is_object()) {
+                if (lower(str_of(*f, "flagStatus")) != lower(core::to_string(status))) {
+                    return make_error(core::ErrorKind::Malformed, "flag response does not match the requested status",
+                                      r.value().status);
+                }
+            }
+        }
+        return core::Status::success();
     } catch (const std::exception&) {
         return make_error(core::ErrorKind::Malformed, "flag request could not be processed");
     }

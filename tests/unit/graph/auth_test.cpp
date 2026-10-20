@@ -167,6 +167,115 @@ TEST_F(AuthFixture, PollStateMachine) {
     EXPECT_EQ(req.url, "https://login.microsoftonline.com/contoso.example/oauth2/v2.0/token");
 }
 
+TEST(PollResultTest, BlockedToString) { EXPECT_STREQ(to_string(PollResult::Blocked), "blocked"); }
+
+TEST_F(AuthFixture, PollPolicyBlocksAreForbiddenWithAadstsCodeOnly) {
+    struct Case {
+        std::string body;
+        std::string expected_code;
+    };
+    const std::string secret = "hostile description Trace ID: abc secret-text";
+    auto body = [&](const std::string& error, std::vector<int> codes, const std::string& desc) {
+        return json{{"error", error}, {"error_description", desc}, {"error_codes", codes}}.dump();
+    };
+    const std::vector<Case> cases = {
+        {body("blocked_by_policy", {53003}, "AADSTS53003: " + secret), "AADSTS53003"},
+        {body("invalid_client", {7000218}, "AADSTS7000218: " + secret), "AADSTS7000218"},
+        {body("unauthorized_client", {700016}, "AADSTS700016: " + secret), "AADSTS700016"},
+        {body("invalid_scope", {}, secret), "invalid_scope"},                       // no code: the error id
+        {body("interaction_required", {}, "AADSTS50076: " + secret), "AADSTS50076"},  // code from the description
+        {body("invalid_request", {530032}, "AADSTS530032: " + secret), "AADSTS530032"},  // numeric code only
+        {body("invalid_request", {7000218}, secret), "AADSTS7000218"},
+        {body("access_blocked", {53003}, secret), "AADSTS53003"},
+    };
+    for (const auto& c : cases) {
+        http = std::make_shared<FakeTransport>();
+        http->expect("POST", "/token", 400, c.body);
+        auto a = auth();
+        auto r = a.poll(challenge());
+        ASSERT_FALSE(r.ok()) << c.body;
+        EXPECT_EQ(r.error().kind, core::ErrorKind::Forbidden) << c.body;
+        EXPECT_EQ(r.error().code, c.expected_code) << c.body;
+        EXPECT_EQ(r.error().http_status, 400);
+        EXPECT_EQ(r.error().message.find("secret"), std::string::npos);
+        EXPECT_EQ(r.error().message.find("DEVICE-SECRET"), std::string::npos);
+        EXPECT_EQ(r.error().code.find("Trace"), std::string::npos);
+        EXPECT_FALSE(store.get_token_blob().has_value());
+    }
+}
+
+TEST_F(AuthFixture, PollPendingWithUnrelatedErrorCodesIsNotBlocked) {
+    // 70016 (pending) must not be confused with 700016 (unauthorized_client)
+    http->expect("POST", "/token", 400, json{{"error", "authorization_pending"}, {"error_codes", {70016}}}.dump());
+    auto a = auth();
+    EXPECT_EQ(a.poll(challenge()).value(), PollResult::Pending);
+}
+
+TEST_F(AuthFixture, PollThrottled429KeepsPolling) {
+    http->expect("POST", "/token", 429, R"({"error":"temporarily_unavailable"})", {{"retry-after", "7"}});
+    http->expect("POST", "/token", 429, "<html>slow down</html>");
+    http->expect("POST", "/token", 200, token_body("AT1", "RT1"));
+    auto a = auth();
+    const auto c = challenge();
+    auto p1 = a.poll(c);
+    ASSERT_TRUE(p1.ok());
+    EXPECT_EQ(p1.value(), PollResult::Pending);
+    EXPECT_EQ(a.poll(c).value(), PollResult::Pending);
+    EXPECT_FALSE(store.get_token_blob().has_value());
+    EXPECT_EQ(a.poll(c).value(), PollResult::Authorized);
+}
+
+TEST_F(AuthFixture, PollWithoutRefreshTokenIsAuthorizedButRefreshTokenIsEmpty) {
+    http->expect("POST", "/token", 200, token_body("AT1", ""));
+    auto a = auth();
+    auto r = a.poll(challenge());
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r.value(), PollResult::Authorized);
+    auto ts = TokenSet::from_json(*store.get_token_blob());
+    ASSERT_TRUE(ts.has_value());
+    EXPECT_EQ(ts->access_token, "AT1");
+    EXPECT_TRUE(ts->refresh_token.empty());
+    EXPECT_FALSE(a.signed_in());
+    // fresh token still usable, then access_token() reports Auth once it expires (nothing to refresh with)
+    EXPECT_EQ(a.access_token().value(), "AT1");
+    clock->advance(3599);
+    auto expired = a.access_token();
+    ASSERT_FALSE(expired.ok());
+    EXPECT_EQ(expired.error().kind, core::ErrorKind::Auth);
+    EXPECT_EQ(http->requests().size(), 1u);  // no refresh attempt without a refresh token
+}
+
+TEST_F(AuthFixture, ExpiresInIsClampedAgainstOverflowAndNegatives) {
+    const std::int64_t year = 86400LL * 365;
+    const std::string huge = R"({"access_token":"AT","refresh_token":"RT","expires_in":9223372036854775807})";
+    const std::string dbl = R"({"access_token":"AT","refresh_token":"RT","expires_in":1e300})";
+    const std::string neg = R"({"access_token":"AT","refresh_token":"RT","expires_in":-5000})";
+    const std::string str = R"({"access_token":"AT","refresh_token":"RT","expires_in":"99999999999"})";
+    const std::pair<std::string, std::int64_t> cases[] = {{huge, year}, {dbl, year}, {neg, 0}, {str, year}};
+    for (const auto& [b, delta] : cases) {
+        http = std::make_shared<FakeTransport>();
+        http->expect("POST", "/token", 200, b);
+        auto a = auth();
+        ASSERT_TRUE(a.poll(challenge()).ok()) << b;
+        auto ts = TokenSet::from_json(*store.get_token_blob());
+        ASSERT_TRUE(ts.has_value());
+        EXPECT_EQ(ts->expires_at, 1'800'000'000 + delta) << b;
+    }
+}
+
+TEST_F(AuthFixture, RefreshBlockedByPolicyReportsAadstsCode) {
+    store_tokens(1'800'000'000 - 10);
+    http->expect("POST", "/token", 400,
+                 json{{"error", "invalid_request"}, {"error_description", "AADSTS53003: Trace ID: secret"}, {"error_codes", {53003}}}.dump());
+    auto a = auth();
+    auto r = a.access_token();
+    ASSERT_FALSE(r.ok());
+    EXPECT_EQ(r.error().kind, core::ErrorKind::Forbidden);
+    EXPECT_EQ(r.error().code, "AADSTS53003");
+    EXPECT_EQ(r.error().message.find("secret"), std::string::npos);
+    EXPECT_TRUE(store.get_token_blob().has_value());  // transient policy block keeps the stored tokens
+}
+
 TEST_F(AuthFixture, PollServerAndNetworkFailuresAreErrors) {
     http->expect("POST", "/token", 503, "<html/>");
     core::Error ne;

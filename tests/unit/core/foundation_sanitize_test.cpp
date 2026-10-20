@@ -483,3 +483,45 @@ TEST(HumanSize, Formatting) {
     EXPECT_EQ(human_size(1023 * 1024 + 900), "1 MB");  // rounds up into the next unit
     EXPECT_NE(human_size(INT64_MAX).find("TB"), std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// HTML5 abrupt-closing comments and additional invisible code points
+// ---------------------------------------------------------------------------
+TEST(HtmlToText, AbruptClosingEmptyCommentsEndImmediately) {
+    EXPECT_EQ(html("a <!--> visible <!-- hidden --> b"), "a visible b");
+    EXPECT_EQ(html("a <!---> visible <!-- hidden --> b"), "a visible b");
+    EXPECT_EQ(html("a <!--->x<!--> y"), "a x y");
+    // Ordinary comments are unaffected, including ones that merely contain '>' or '->' later.
+    EXPECT_EQ(html("a <!-- x > y -> z --> b"), "a b");
+    EXPECT_EQ(html("a <!---- c --> b"), "a b");
+    // "<!--" at the very end of the input is an unterminated comment.
+    EXPECT_EQ(html("a <!--"), "a");
+    EXPECT_EQ(html("a <!---"), "a");
+}
+
+TEST(HtmlToText, CommentEndedByBangVariant) {
+    EXPECT_EQ(html("a <!-- c --!> b"), "a b");
+}
+
+TEST(Sanitize, StripsAdditionalInvisibleCodePoints) {
+    bool t = false;
+    const std::string arabic_letter_mark = "\xD8\x9C";                 // U+061C
+    const std::string mongolian_vs = "\xE1\xA0\x8E";                   // U+180E
+    const std::string anno_a = "\xEF\xBF\xB9";                          // U+FFF9
+    const std::string anno_b = "\xEF\xBF\xBA";                          // U+FFFA
+    const std::string anno_c = "\xEF\xBF\xBB";                          // U+FFFB
+    const std::string tag_a = "\xF3\xA0\x80\x81";                       // U+E0001 language tag
+    const std::string tag_first = "\xF3\xA0\x80\x80";                   // U+E0000
+    const std::string tag_last = "\xF3\xA0\x81\xBF";                    // U+E007F cancel tag
+    const std::string tag_x = "\xF3\xA0\x81\xB8";                       // U+E0078 tag latin small x
+    const std::string next_after_tags = "\xF3\xA0\x82\x80";             // U+E0080 is NOT a tag character
+    const std::string in = "a" + arabic_letter_mark + mongolian_vs + anno_a + anno_b + anno_c + tag_first + tag_a +
+                           tag_x + tag_last + "b";
+    EXPECT_EQ(sanitize_text(in, 100, t), "ab");
+    EXPECT_EQ(sanitize_line(in, 100), "ab");
+    EXPECT_EQ(html("a" + arabic_letter_mark + "<b>" + tag_x + "b</b>"), "ab");
+    EXPECT_EQ(sanitize_line("a" + next_after_tags + "b", 100), "a" + next_after_tags + "b");
+    // Neighbouring visible characters are kept: U+061B (Arabic semicolon) and U+FFFC (object replacement).
+    EXPECT_EQ(sanitize_line("\xD8\x9B", 100), "\xD8\x9B");
+    EXPECT_EQ(sanitize_line("\xEF\xBF\xBC", 100), "\xEF\xBF\xBC");
+}

@@ -171,11 +171,29 @@ TEST_F(Fixture, LinkToForeignOriginIsRefusedWithoutSendingToken) {
     auto b = backend();
     auto r = b.fetch_inbox_delta("https://evil.example/v1.0/me/delta?$skiptoken=x");
     ASSERT_FALSE(r.ok());
-    EXPECT_EQ(r.error().kind, core::ErrorKind::Invalid);
+    // Gone, not Invalid: a stored link from another endpoint (data dir reused with a different base URL) makes the
+    // core do a full resync instead of failing forever. The bearer token is still never sent there.
+    EXPECT_EQ(r.error().kind, core::ErrorKind::Gone);
     EXPECT_TRUE(http->requests().empty());
     auto r2 = b.fetch_inbox_delta("https://graph.microsoft.com@evil.example/v1.0/me/delta");
     ASSERT_FALSE(r2.ok());
+    EXPECT_EQ(r2.error().kind, core::ErrorKind::Gone);
     EXPECT_TRUE(http->requests().empty());
+}
+
+TEST_F(Fixture, StoredLinkFromDifferentBaseUrlIsGoneThenFullResyncWorks) {
+    auto b = backend();
+    const std::string stale = "http://127.0.0.1:8765/v1.0/me/mailFolders('a')/messages/delta?$deltatoken=old";
+    auto gone = b.fetch_inbox_delta(stale);
+    ASSERT_FALSE(gone.ok());
+    EXPECT_EQ(gone.error().kind, core::ErrorKind::Gone);
+    EXPECT_TRUE(http->requests().empty());
+    // the core then asks for a full resync with an empty link, which goes to the configured endpoint
+    http->expect("GET", "/delta", 200, delta_page({full_message("m1")}, "@odata.deltaLink", std::string(kBase) + "/d?$deltatoken=1"));
+    auto full = b.fetch_inbox_delta("");
+    ASSERT_TRUE(full.ok());
+    ASSERT_EQ(http->requests().size(), 1u);
+    EXPECT_EQ(http->requests()[0].url.rfind(kBase, 0), 0u);
 }
 
 TEST_F(Fixture, ImmutableIdPreferIsSentOnEveryRequestKind) {
@@ -240,6 +258,28 @@ TEST_F(Fixture, PartialDeltaItemThatVanishedBecomesRemoved) {
     EXPECT_EQ(r.value().changed[0].id, "keep");
     ASSERT_EQ(r.value().removed_ids.size(), 1u);
     EXPECT_EQ(r.value().removed_ids[0], "gone1");
+}
+
+TEST_F(Fixture, PartialFollowUpNon404ItemNotFoundIsAnErrorNotARemoval) {
+    // A proxy page, captive portal or wrong base URL answers 404 without a Graph error code. That must not strip
+    // items from the page and still complete the sync.
+    const char* kBodies[] = {"<html><body>404 Not Found</body></html>", "", "{}", R"({"error":{"message":"x"}})",
+                             R"({"error":{"code":"ErrorFolderNotFound","message":"x"}})",
+                             R"({"error":{"code":"ResourceNotFound","message":"x"}})"};
+    for (const char* body : kBodies) {
+        http = std::make_shared<FakeTransport>();
+        http->expect("GET", "/delta", 200,
+                     delta_page({full_message("keep"), R"({"id":"p1","isRead":true})", R"({"id":"p2","isRead":true})"},
+                                "@odata.deltaLink", "https://graph.microsoft.com/v1.0/d?$deltatoken=9"));
+        http->expect("GET", "/me/messages/p1", 404, body);
+        auto b = backend();
+        auto r = b.fetch_inbox_delta("");
+        ASSERT_FALSE(r.ok()) << "body: " << body;
+        EXPECT_EQ(r.error().kind, core::ErrorKind::NotFound) << "body: " << body;
+        EXPECT_EQ(r.error().http_status, 404);
+        EXPECT_NE(r.error().code, "ErrorItemNotFound");
+        EXPECT_EQ(http->requests().size(), 2u);  // stopped at the first failing follow-up
+    }
 }
 
 TEST_F(Fixture, PartialFollowUpOtherErrorsPropagate) {
@@ -380,6 +420,17 @@ TEST_F(Fixture, MapHttpErrorTable) {
     EXPECT_EQ(map(400, "{}").kind, core::ErrorKind::Invalid);
     EXPECT_EQ(map(404, R"({"error":{"message":"m","innererror":{"code":"inner"}}})").code, "inner");  // lower-case variant
     EXPECT_EQ(map(404, "{broken").code, "");
+    // Non-JSON bodies (proxy / captive portal / wrong base URL): empty code, and the message says why.
+    for (const char* body : {"<html>Not Found</html>", "", "{broken", "plain text"}) {
+        const auto e = map(404, body);
+        EXPECT_EQ(e.kind, core::ErrorKind::NotFound);
+        EXPECT_EQ(e.code, "");
+        EXPECT_EQ(e.message, "non-JSON 404 response");
+        EXPECT_EQ(e.http_status, 404);
+    }
+    EXPECT_EQ(map(502, "<html>Bad gateway</html>").message, "non-JSON 502 response");
+    EXPECT_EQ(map(502, "<html>Bad gateway</html>").kind, core::ErrorKind::Server);
+    EXPECT_EQ(map(404, "{}").message.find("non-JSON"), std::string::npos);  // JSON without an error object is not "non-JSON"
     EXPECT_EQ(map(404, R"({"error":{"code":"ErrorItemNotFound","message":"secret subject"}})").message.find("secret"),
               std::string::npos);  // server message text is never copied into Error::message
 }
@@ -483,6 +534,37 @@ TEST_F(Fixture, SetFlagSendsPatchBody) {
     const json complete = json::parse(rs[2].body);
     EXPECT_EQ(complete["flag"]["flagStatus"], "complete");
     EXPECT_EQ(complete["flag"]["completedDateTime"]["timeZone"], "UTC");
+}
+
+TEST_F(Fixture, SetFlagValidatesFlagStatusInResponse) {
+    auto b = backend();
+    // matching body (case-insensitive compare of the enum string), non-JSON, and JSON without a flag object: accepted
+    http->expect("PATCH", "/me/messages/m1", 200, full_message("m1"));  // full_message has flagStatus "flagged"
+    EXPECT_TRUE(b.set_flag("m1", core::FlagStatus::Flagged).ok());
+    http->expect("PATCH", "/me/messages/m1", 200, R"({"flag":{"flagStatus":"notFlagged"}})");
+    EXPECT_TRUE(b.set_flag("m1", core::FlagStatus::NotFlagged).ok());
+    http->expect("PATCH", "/me/messages/m1", 200, R"({"flag":{"flagStatus":"complete","completedDateTime":{}}})");
+    EXPECT_TRUE(b.set_flag("m1", core::FlagStatus::Complete).ok());
+    http->expect("PATCH", "/me/messages/m1", 200, "not json");
+    EXPECT_TRUE(b.set_flag("m1", core::FlagStatus::Flagged).ok());
+    http->expect("PATCH", "/me/messages/m1", 200, R"({"id":"m1"})");
+    EXPECT_TRUE(b.set_flag("m1", core::FlagStatus::Flagged).ok());
+    http->expect("PATCH", "/me/messages/m1", 204, "");
+    EXPECT_TRUE(b.set_flag("m1", core::FlagStatus::Flagged).ok());
+
+    // mismatching status: Malformed, not success
+    http->expect("PATCH", "/me/messages/m1", 200, R"({"flag":{"flagStatus":"notFlagged"}})");
+    auto s1 = b.set_flag("m1", core::FlagStatus::Flagged);
+    ASSERT_FALSE(s1.ok());
+    EXPECT_EQ(s1.error().kind, core::ErrorKind::Malformed);
+    http->expect("PATCH", "/me/messages/m1", 200, full_message("m1"));  // says "flagged" but we asked for complete
+    auto s2 = b.set_flag("m1", core::FlagStatus::Complete);
+    ASSERT_FALSE(s2.ok());
+    EXPECT_EQ(s2.error().kind, core::ErrorKind::Malformed);
+    // a flag object without flagStatus is not a confirmation either
+    http->expect("PATCH", "/me/messages/m1", 200, R"({"flag":{}})");
+    EXPECT_EQ(b.set_flag("m1", core::FlagStatus::Flagged).error().kind, core::ErrorKind::Malformed);
+    EXPECT_EQ(http->unmatched(), 0u);
 }
 
 TEST_F(Fixture, SetFlagFailureIsReported) {

@@ -38,7 +38,10 @@ struct DeviceCodeChallenge {
     int interval = 5;
 };
 
-enum class PollResult { Pending, SlowDown, Authorized, Declined, Expired, BadCode, Error };
+// Blocked: the token endpoint refused for policy/configuration reasons (Conditional Access, app registration,
+// consent, scope). poll() currently reports it as an ErrorKind::Forbidden Outcome error carrying the AADSTS code in
+// Error::code (so the code reaches the caller); the enumerator exists for callers that map the outcome to a state.
+enum class PollResult { Pending, SlowDown, Authorized, Declined, Expired, BadCode, Error, Blocked };
 const char* to_string(PollResult r);
 
 // Persisted as an opaque JSON blob via Store::put_token_blob. Fields are the OAuth token response subset.

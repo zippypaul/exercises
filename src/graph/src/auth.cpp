@@ -1,5 +1,7 @@
 #include "slowmail/graph/auth.hpp"
 
+#include <algorithm>
+
 #include <nlohmann/json.hpp>
 
 #include "slowmail/core/log.hpp"
@@ -19,6 +21,7 @@ const char* to_string(PollResult r) {
     case PollResult::Expired: return "expired";
     case PollResult::BadCode: return "bad_code";
     case PollResult::Error: return "error";
+    case PollResult::Blocked: return "blocked";
     }
     return "unknown";
 }
@@ -63,6 +66,7 @@ std::optional<TokenSet> TokenSet::from_json(const std::string& s) {
 namespace {
 
 constexpr std::int64_t kRefreshSkewSeconds = 300;  // contract: refresh proactively when < ~5 minutes remain
+constexpr std::int64_t kMaxExpiresInSeconds = 86400LL * 365;  // a hostile/garbled expires_in must not overflow now + x
 
 core::Error make_error(core::ErrorKind kind, std::string msg, int status = 0, std::string code = {}) {
     core::Error e;
@@ -95,7 +99,12 @@ std::int64_t json_int(const json& j, const char* key, std::int64_t fallback) {
     auto it = j.find(key);
     if (it == j.end()) return fallback;
     if (it->is_number_integer()) return it->get<std::int64_t>();
-    if (it->is_number()) return static_cast<std::int64_t>(it->get<double>());
+    if (it->is_number()) {
+        const double d = it->get<double>();
+        if (!(d > -1e15)) return -1'000'000'000'000'000;  // also catches NaN
+        if (d > 1e15) return 1'000'000'000'000'000;
+        return static_cast<std::int64_t>(d);
+    }
     if (it->is_string()) {
         try {
             return std::stoll(it->get<std::string>());
@@ -166,7 +175,7 @@ core::Outcome<TokenSet> token_from_response(const std::string& body, std::int64_
     } else if (previous) {
         t.refresh_token = previous->refresh_token;
     }
-    t.expires_at = now + json_int(j, "expires_in", 3600);
+    t.expires_at = now + std::clamp<std::int64_t>(json_int(j, "expires_in", 3600), 0, kMaxExpiresInSeconds);
     t.scope = core::sanitize_line(json_string(j, "scope").value_or(previous ? previous->scope : std::string()), 1024);
     if (auto idt = json_string(j, "id_token"); idt && !idt->empty()) t.account_hint = account_hint_from_id_token(*idt);
     if (t.account_hint.empty() && previous) t.account_hint = previous->account_hint;
@@ -177,14 +186,35 @@ struct OAuthError {
     std::string error;       // "error" field, cleaned
     bool blocked_by_policy = false;  // Conditional Access / flow block (AADSTS53xxxx)
     bool refresh_revoked = false;    // AADSTS530036 style flow-check revocation
+    bool poll_blocked = false;       // token-endpoint policy/config block seen while polling (see is_poll_block)
+    std::string aadsts;              // "AADSTS<digits>" taken from error_codes (or the description), never free text
 };
+
+bool is_poll_block_code(std::int64_t v) { return v == 53003 || v == 530032 || v == 7000218 || v == 700016; }
+
+bool is_poll_block_error(const std::string& e) {
+    return e == "blocked_by_policy" || e == "invalid_client" || e == "unauthorized_client" || e == "invalid_scope" ||
+           e == "interaction_required";
+}
+
+// Extracts the first "AADSTS<digits>" token (digits only, at most 8) from a description. Only the code is kept.
+std::string aadsts_from_description(const std::string& d) {
+    const auto p = d.find("AADSTS");
+    if (p == std::string::npos) return {};
+    std::size_t i = p + 6;
+    std::string digits;
+    while (i < d.size() && d[i] >= '0' && d[i] <= '9' && digits.size() < 8) digits.push_back(d[i++]);
+    return digits.empty() ? std::string() : "AADSTS" + digits;
+}
 
 OAuthError parse_oauth_error(const std::string& body) {
     OAuthError e;
     const json j = json::parse(body, nullptr, false);
     if (j.is_discarded() || !j.is_object()) return e;
     if (auto s = json_string(j, "error")) e.error = clean_code(*s);
+    if (is_poll_block_error(e.error)) e.poll_blocked = true;
     if (auto d = json_string(j, "error_description")) {
+        e.aadsts = aadsts_from_description(*d);
         if (d->find("AADSTS530036") != std::string::npos) e.refresh_revoked = true;
         if (d->find("AADSTS53") != std::string::npos || d->find("AADSTS50005") != std::string::npos) {
             e.blocked_by_policy = true;
@@ -197,6 +227,10 @@ OAuthError parse_oauth_error(const std::string& body) {
                 const auto v = c.get<std::int64_t>();
                 if (v == 530036) e.refresh_revoked = true;
                 if (v >= 530000 && v < 540000) e.blocked_by_policy = true;
+                if (is_poll_block_code(v)) {
+                    e.poll_blocked = true;
+                    if (v > 0 && v < 100000000) e.aadsts = "AADSTS" + std::to_string(v);  // the numeric code wins
+                }
             }
         }
     }
@@ -255,7 +289,7 @@ core::Outcome<DeviceCodeChallenge> DeviceCodeAuth::begin() {
             const OAuthError oe = parse_oauth_error(resp.body);
             if (oe.blocked_by_policy) {
                 return make_error(core::ErrorKind::Forbidden, "device code sign-in is blocked by organisation policy",
-                                  resp.status, oe.error);
+                                  resp.status, !oe.aadsts.empty() ? oe.aadsts : oe.error);
             }
             if (resp.status >= 500) {
                 return make_error(core::ErrorKind::Server, "device code endpoint unavailable", resp.status, oe.error);
@@ -271,8 +305,8 @@ core::Outcome<DeviceCodeChallenge> DeviceCodeAuth::begin() {
         c.user_code = core::sanitize_line(json_string(j, "user_code").value_or(""), 64);
         c.verification_uri = core::sanitize_line(json_string(j, "verification_uri").value_or(""), 512);
         c.message = core::sanitize_line(json_string(j, "message").value_or(""), 1024);
-        c.expires_in = static_cast<int>(json_int(j, "expires_in", 900));
-        c.interval = static_cast<int>(json_int(j, "interval", 5));
+        c.expires_in = static_cast<int>(std::clamp<std::int64_t>(json_int(j, "expires_in", 900), 0, kMaxExpiresInSeconds));
+        c.interval = static_cast<int>(std::clamp<std::int64_t>(json_int(j, "interval", 5), 0, 3600));
         if (c.interval <= 0) c.interval = 5;
         if (c.device_code.empty() || c.user_code.empty() || c.verification_uri.empty()) {
             return make_error(core::ErrorKind::Malformed, "device code response is missing fields", resp.status);
@@ -302,6 +336,12 @@ core::Outcome<PollResult> DeviceCodeAuth::poll(const DeviceCodeChallenge& challe
             cached_ = ts.value();
             return PollResult::Authorized;
         }
+        if (resp.status == 429) {
+            // Throttled while waiting for the user: keep polling (the caller sleeps at least `interval`); a 429 must
+            // not abort a sign-in the user is still completing.
+            SLOWMAIL_LOG_INFO("device code poll throttled (HTTP 429); will keep polling");
+            return PollResult::Pending;
+        }
         if (resp.status >= 500) {
             return make_error(core::ErrorKind::Server, "token endpoint unavailable", resp.status);
         }
@@ -311,6 +351,11 @@ core::Outcome<PollResult> DeviceCodeAuth::poll(const DeviceCodeChallenge& challe
         if (oe.error == "authorization_declined" || oe.error == "access_denied") return PollResult::Declined;
         if (oe.error == "expired_token") return PollResult::Expired;
         if (oe.error == "bad_verification_code") return PollResult::BadCode;
+        if (oe.poll_blocked || oe.blocked_by_policy) {
+            // Only the AADSTS code (or the short OAuth error identifier) is kept; never the description text.
+            return make_error(core::ErrorKind::Forbidden, "sign-in is blocked by organisation policy or app configuration",
+                              resp.status, !oe.aadsts.empty() ? oe.aadsts : oe.error);
+        }
         SLOWMAIL_LOG_WARN("device code poll failed: http " + std::to_string(resp.status) + " code=" + oe.error);
         return PollResult::Error;
     } catch (const std::exception&) {
@@ -374,7 +419,7 @@ core::Outcome<TokenSet> DeviceCodeAuth::refresh(const std::string& refresh_token
         }
         if (oe.blocked_by_policy) {
             return make_error(core::ErrorKind::Forbidden, "token refresh blocked by organisation policy", resp.status,
-                              oe.error);
+                              !oe.aadsts.empty() ? oe.aadsts : oe.error);
         }
         return make_error(core::ErrorKind::Auth, "token refresh rejected", resp.status, oe.error);
     } catch (const std::exception&) {

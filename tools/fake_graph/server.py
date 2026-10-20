@@ -45,6 +45,7 @@ TENANT_GUID = "11111111-2222-4333-8444-555555555555"
 FLAG_VALUES = ("notFlagged", "flagged", "complete")
 READ_ONLY_FIELDS = {"subject", "body", "from", "sender", "toRecipients", "ccRecipients", "bccRecipients",
                     "bodyPreview", "receivedDateTime", "sentDateTime", "conversationId", "internetMessageId"}
+LOG_MAX = 5000
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
 
 
@@ -79,6 +80,9 @@ class Config:
     doc_style_odata_type: bool = False    # attachment @odata.type without leading '#'
     default_page_size: int = 10
     max_page_size: int = 1000
+    scope_check: bool = True              # move/PATCH/DELETE need Mail.ReadWrite in the token scope, else 403 ErrorAccessDenied
+    remove_already_moved_404: bool = False  # re-moving a message already in the destination: 404 ErrorItemNotFound
+                                            # (real Graph behaviour is UNVERIFIED, ASM-34); default is a 201 no-op
 
     def update(self, values: Dict[str, Any]) -> None:
         fields = {f.name: f for f in dataclasses.fields(self)}
@@ -390,6 +394,7 @@ class Req:
         self.prefs = parse_prefer(headers)
         self.request_id = str(uuid.uuid4())
         self.client_request_id = headers.get("client-request-id") or self.request_id
+        self.token_scope = ""  # scope string of the bearer token, set by App._check_auth
 
     def q(self, name: str) -> Optional[str]:
         vals = self.query.get(name)
@@ -443,8 +448,11 @@ class App:
         self.drops: List[Dict[str, Any]] = []
         self.counters: Dict[str, Any] = {"requests": 0, "forbidden_fetch": 0, "content_bytes_served": 0,
                                          "delete_calls": 0, "graph_401": 0, "refreshes": 0,
-                                         "device_codes_issued": 0, "by_path": {}}
-        self.log: Deque[Dict[str, Any]] = collections.deque(maxlen=200)
+                                         "device_codes_issued": 0,
+                                         # request-time invariants, so assertions do not depend on the capped log
+                                         "graph_requests": 0, "requests_missing_immutable_prefer": 0,
+                                         "requests_with_value_or_contentbytes": 0, "by_path": {}}
+        self.log: Deque[Dict[str, Any]] = collections.deque(maxlen=LOG_MAX)
         self.seq = 0
 
     def reset(self, keep_auth: bool = False) -> None:
@@ -537,6 +545,7 @@ class App:
             by_path = self.counters["by_path"]
             by_path[key] = by_path.get(key, 0) + 1
             self.seq += 1
+            self._count_invariants(req)
             entry = {"seq": self.seq, "method": req.method, "path": req.path, "query": urlsplit(req.target).query,
                      "headers": self._header_subset(req), "body_length": len(req.body), "status": None}
             self.log.append(entry)
@@ -562,6 +571,17 @@ class App:
         if delay:
             time.sleep(delay)
         return resp, drop is not None
+
+    def _count_invariants(self, req: Req) -> None:
+        """Counts, at request time, Graph calls that break the two request-shape rules (see README)."""
+        if not req.path.startswith("/v1.0/"):
+            return
+        self.counters["graph_requests"] += 1
+        if req.prefs.get("idtype", "").lower() != "immutableid":
+            self.counters["requests_missing_immutable_prefer"] += 1
+        wire = (req.target + " " + req.path).lower()
+        if "$value" in wire or "contentbytes" in wire:
+            self.counters["requests_with_value_or_contentbytes"] += 1
 
     @staticmethod
     def _header_subset(req: Req) -> Dict[str, str]:
@@ -664,6 +684,15 @@ class App:
             raise ApiError(401, "InvalidAuthenticationToken",
                            "Access token is empty, expired or invalid." if tok is None else "Access token has expired.",
                            [("WWW-Authenticate", 'Bearer realm="", authorization_uri="https://login.microsoftonline.com/common/oauth2/authorize"')])
+        req.token_scope = str(tok.get("scope", ""))
+
+    def _require_write_scope(self, req: Req) -> None:
+        """Move, PATCH and DELETE need Mail.ReadWrite (message-move permissions table); Mail.Read is not enough."""
+        if not self.config.scope_check:
+            return
+        granted = {s.rsplit("/", 1)[-1].lower() for s in req.token_scope.split()}
+        if "mail.readwrite" not in granted:
+            raise ApiError(403, "ErrorAccessDenied", "Access is denied. Check credentials and try again.")
 
     # ---- OAuth
     @staticmethod
@@ -900,6 +929,8 @@ class App:
 
     # ---- Graph: messages
     def message_route(self, req: Req, ctx: Ctx, ident: str, rest: List[str]) -> Optional[Resp]:
+        if (not rest and req.method in ("PATCH", "DELETE")) or (rest[:1] == ["move"] and req.method == "POST"):
+            self._require_write_scope(req)
         msg = self.mailbox.find(ident, ctx.immutable)
         if msg is None:
             raise ApiError(404, "ErrorItemNotFound", "The specified object was not found in the store.")
@@ -923,6 +954,10 @@ class App:
             dest = self.resolve_folder(str(dest_ident))
             if dest is None:
                 raise ApiError(404, "ErrorFolderNotFound", "The specified folder could not be found in the store.")
+            if msg.folder == dest and self.config.remove_already_moved_404:
+                # UNVERIFIED (ASM-34): real Graph may answer a re-move of a message already in the destination
+                # with 404 instead of a 201 no-op. The switch lets the contract tests run both worlds.
+                raise ApiError(404, "ErrorItemNotFound", "The specified object was not found in the store.")
             self.mailbox.move(msg, dest)  # no-op when already there
             return Resp(201, {"@odata.context": ctxurl + "/$entity", **msg.render(ctx)})
         elif rest[0] == "attachments" and method == "GET":
@@ -1210,6 +1245,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--delta-expiry-status", type=int, choices=(400, 410), default=410)
     ap.add_argument("--immutable-gap", action="store_true", help="emulate the Graph immutable-id delta known issue")
     ap.add_argument("--trailing-empty-page", action="store_true")
+    ap.add_argument("--scope-check", action=argparse.BooleanOptionalAction, default=True,
+                    help="move/PATCH/DELETE need Mail.ReadWrite in the token scope, else 403 ErrorAccessDenied (default on)")
+    ap.add_argument("--remove-already-moved-404", action="store_true",
+                    help="re-moving a message that is already in the destination folder answers 404 ErrorItemNotFound "
+                         "instead of a 201 no-op (real Graph behaviour UNVERIFIED, ASM-34)")
     ap.add_argument("--exit-on-stdin-eof", action="store_true", help="exit when stdin closes (parent died)")
     return ap.parse_args(argv)
 
@@ -1222,7 +1262,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                  strict_refresh=not args.lenient_refresh, has_archive=not args.no_archive,
                  delta_partial_updates=args.delta_partial_updates, delta_replay=args.delta_replay,
                  delta_expiry_status=args.delta_expiry_status, immutable_gap=args.immutable_gap,
-                 trailing_empty_page=args.trailing_empty_page)
+                 trailing_empty_page=args.trailing_empty_page, scope_check=args.scope_check,
+                 remove_already_moved_404=args.remove_already_moved_404)
     srv = make_server(cfg, args.host, args.port, args.verbose)
     try:
         if args.load:
