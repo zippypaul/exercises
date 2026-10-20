@@ -98,3 +98,62 @@ Deviations from the plan, known failures, follow-ups:
 
 Assumptions updated: ASM-20 (vendored nlohmann/json) and ASM-21 (cortexa53 env script) confirmed by the successful SDK cross-build; ASM-19 partially: the SDK Qt 6.8.2 build of the UI compiles, runtime unverified.
 
+## 2026-10-20 - Adversarial review round: fixes and re-run (host + aarch64 under QEMU)
+
+| Field | Value |
+|---|---|
+| Date / time (UTC) | 2026-10-20 20:05-20:50 |
+| Tester / agent | Claude (independent review agent, three fix agents, integrator re-ran everything from clean build directories) |
+| Commit id | a9f808f (review fixes) plus this log entry |
+| Level | simulator + fake server (host); fake server (aarch64 under QEMU). Real mailbox: NOT YET. Device: NOT YET. |
+| Environment | as in the previous entry |
+
+Review findings (18 raised; severity per the reviewer) and outcome:
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | High: one network error left the session Offline for good; nothing re-sent pending commands; refresh refused | Fixed: actions, flush and refresh always attempt delivery; any server answer clears Offline; refresh flushes first; start() makes one bounded flush; UI "Send pending (N)" button; tests `TriageSession.*AfterOneNetworkBlip*`, `*RefreshFromOffline*` |
+| 2 | High: a Failed message vanished from every list with no retry | Fixed: `failed()`/`retry()` in the facade, Failed section with Retry in the UI, `failed`/`retry` CLI commands; Server/Forbidden/Conflict stay Pending with capped backoff instead of failing after 8 attempts; a successful sync un-hides a Failed row |
+| 3 | High: cooldown used CLOCK_MONOTONIC, which stops in suspend | Fixed: CLOCK_BOOTTIME, and eligible when either monotonic or wall elapsed reaches the cooldown (D23 revised) |
+| 4 | Medium: SQLite kept the tombstone when a gone message returned, so it was hidden and purged; MemoryStore did not | Fixed in `set_message_state` (schema v2 migration repairs old rows); new `integration_tests` target runs engine scenarios over MemoryStore and SqliteStore |
+| 5 | Medium: a 404 with no Graph code counted as "already gone" (core and partial-item follow-up) | Fixed in both places: only `ErrorItemNotFound` means gone; empty code is retryable; non-JSON bodies labelled |
+| 6 | Medium: any changed delta entry resurrected Archived/Deleted/Gone rows regardless of folder; changes applied before removals | Fixed: Inbox folder id learned from full enumeration, restore only when parent folder matches; removals first |
+| 7 | Medium: local write failure after server confirmation left the command InFlight until restart | Fixed: retry the write once then back to Pending; `process()` recovers InFlight first; park/fail writes checked |
+| 8 | Test validity: A06 passed only because the fake treats a re-move as a no-op | Fake gained `--remove-already-moved-404`; a second A06 contract test asserts the outcome in that mode (no duplicate, no loss, undo unavailable); ASM-34 records the open question |
+| 9 | Low: same-second commands ordered randomly in SQLite | Fixed: order by rowid on ties |
+| 10 | Low: tenant policy block at the token endpoint reported as a generic error | Fixed: Forbidden with AADSTS code; distinct UI/CLI message |
+| 11 | Low: a stored delta link from another origin stranded sync | Fixed: mapped to Gone (full resync), token never sent |
+| 12 | Low: `not_before` on wall time could park a command far in the future | Fixed: clamped on read |
+| 13 | Low: worker thread sleeps on throttling; shutdown waits on it | Not fixed; recorded as R-WORKER-BLOCKING |
+| 14 | Low: `set_flag` confirmed on any 2xx | Fixed: response `flagStatus` validated |
+| 15 | Low: no single-instance lock on the data directory | Not fixed; recorded as R-NO-INSTANCE-LOCK |
+| 16 | Low: `<!-->` / `<!--->` swallowed text; some invisible code points passed | Fixed with tests; 12k-input fuzz by the reviewer found no unsafe output before or after |
+| 17 | Low: fake-server request log capped at 200; scope never checked | Fixed: counters independent of the log; Mail.ReadWrite enforced for writes |
+| 18 | Nits (poll interval overflow, PlainText, expires_in overflow) | Fixed |
+
+Commands run (same as the previous entry, from clean `build-int` and `build-device`):
+
+```
+rm -rf build-int && cmake -S . -B build-int -G Ninja && cmake --build build-int && (cd build-int && ctest)
+python3 -I tools/fake_graph/test_server.py
+source /opt/codex/ferrari/5.7.119/environment-setup-cortexa53-crypto-remarkable-linux && rm -rf build-device && cmake -S . -B build-device -G Ninja && cmake --build build-device
+SLOWMAIL_TEST_TIME_SCALE=10 qemu-aarch64-static -L $SDKTARGETSYSROOT ./build-device/tests/unit/{core,storage,graph,integration}_tests
+SLOWMAIL_TEST_TIME_SCALE=10 qemu-aarch64-static -L $SDKTARGETSYSROOT ./build-device/tests/contract/contract_tests
+```
+
+Results:
+
+| Item | Host | aarch64 under QEMU |
+|---|---|---|
+| core_tests | pass 231/231 | pass 231/231 |
+| storage_tests | pass 102/102 (+1 skipped as root) | pass 102/102 (+1 skipped) |
+| graph_tests | pass 76/76 | pass 76/76 |
+| integration_tests (new) | pass 22/22 | pass 22/22 |
+| contract_tests | pass 29/29 (17 s) | pass 29/29 (90 s) |
+| fake server self-tests | pass 60/60 | n/a |
+| ctest | 5/5 targets | n/a |
+| Warnings in project sources | none | none |
+| CLI end-to-end (fake server) | pass: a dropped move left the archive Pending and the next delete was still delivered; the pending archive was sent on the next start; a missing Archive folder produced a Failed row with `ErrorFolderNotFound`, `failed` listed it, `retry` confirmed it after the folder was restored; final server state inbox 9 / archive 2 / deleteditems 1; all four request-shape counters 0 | n/a |
+| Simulator screenshots | regenerated in docs/screenshots/simulator (queue shows "Failed 1" and "Send pending (1)"; activity shows the Failed section with Retry) | UI binary built, not executed |
+
+Deviations, follow-ups: findings 13 and 15 are open risks. The `SLOWMAIL_TEST_TIME_SCALE` knob now also covers the 1 MB sanitiser benchmark. No real-mailbox or hardware run.
