@@ -53,6 +53,7 @@ bool grab(QQuickWindow* win, const QString& dir, const QString& name) {
         return false;
     }
     std::printf("screenshot: %s (%dx%d)\n", qPrintable(path), img.width(), img.height());
+    std::fflush(stdout);
     return true;
 }
 
@@ -122,7 +123,10 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<slowmail::app::AppContext> ctx;
     QString configError;
     const slowmail::app::AppConfig cfg = slowmail::app::AppConfig::from_environment();
-    if (simulator) std::fputs(cfg.describe().c_str(), stdout);
+    if (simulator) {
+        std::fputs(cfg.describe().c_str(), stdout);
+        std::fflush(stdout);
+    }
     if (!demo) {
         std::string err;
         ctx = slowmail::app::AppContext::create(cfg, err);
@@ -137,7 +141,7 @@ int main(int argc, char* argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("triage"), &triage);
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed, &app, []() { QCoreApplication::exit(1); },
                      Qt::QueuedConnection);
-    engine.load(QUrl(QStringLiteral("qrc:/SlowMail/qml/Main.qml")));
+    engine.load(QUrl(QStringLiteral("qrc:/SlowMail/Main.qml")));
     if (engine.rootObjects().isEmpty()) return 1;
 
     QObject::connect(&app, &QCoreApplication::aboutToQuit, &triage, [&triage]() { triage.shutdown(); });

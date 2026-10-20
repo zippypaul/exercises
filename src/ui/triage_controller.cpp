@@ -207,7 +207,7 @@ Snapshot TriageWorker::makeSnapshot() {
         QVariantMap row;
         row.insert(QStringLiteral("id"), q(m.id));
         row.insert(QStringLiteral("subject"), q(m.subject));
-        row.insert(QStringLiteral("fromName"), q(m.from.name.empty() ? m.from.address : m.from.name));
+        row.insert(QStringLiteral("fromName"), (m.from.name.empty() && m.from.address.empty()) ? QStringLiteral("(unknown sender)") : q(m.from.name.empty() ? m.from.address : m.from.name));
         row.insert(QStringLiteral("fromAddress"), q(m.from.address));
         row.insert(QStringLiteral("receivedAt"), formatReceived(m));
         row.insert(QStringLiteral("preview"), q(m.body_preview));
@@ -243,7 +243,7 @@ Snapshot TriageWorker::makeSnapshot() {
         row.insert(QStringLiteral("type"), QString::fromLatin1(lab.label));
         row.insert(QStringLiteral("typeKey"), QString::fromLatin1(lab.key));
         row.insert(QStringLiteral("subject"), q(a.subject));
-        row.insert(QStringLiteral("from"), q(a.from_name.empty() ? a.from_address : a.from_name));
+        row.insert(QStringLiteral("from"), (a.from_name.empty() && a.from_address.empty()) ? QStringLiteral("(unknown sender)") : q(a.from_name.empty() ? a.from_address : a.from_name));
         row.insert(QStringLiteral("time"),
                    QDateTime::fromSecsSinceEpoch(a.event.timestamp).toString(QStringLiteral("HH:mm")));
         row.insert(QStringLiteral("confirmation"), confirmationLabel(a.event.confirmation));
